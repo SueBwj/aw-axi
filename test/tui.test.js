@@ -324,11 +324,12 @@ function seed(state) {
 
 function pty(args, key) {
   const script = `
-import os, pty, select, sys, time
+import fcntl, os, pty, select, struct, sys, termios, time
 node, program, *args = sys.argv[1:]
 key = os.environ["TUI_KEY"].encode()
 pid, fd = pty.fork()
 if pid == 0:
+    fcntl.ioctl(1, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
     os.execv(node, [node, program, *args])
 buf = b""
 sent = False

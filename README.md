@@ -29,7 +29,7 @@ node bin/aw-axi.js --tui --base-url "$AWAXI_BASE_URL"
 
 `--base-url` (or the `AWAXI_BASE_URL` environment variable) is required for every server command.
 There is no default port, so a command cannot reach a server by surprise.
-The example port is illustrative; start or select your own server and use its actual address. Read-only status and dashboard commands above do not change server data. To write, select a private state directory explicitly.
+The example port is illustrative; start or select your own server and use its actual address. Read-only status and dashboard commands above do not change server data. Before changing server data, select a private state directory.
 
 ```sh
 node bin/aw-axi.js timer start --label "Reading" --base-url "$AWAXI_BASE_URL" --state "$HOME/.local/state/activitywatch-axi"
@@ -37,14 +37,14 @@ node bin/aw-axi.js timer stop --label "Reading" --base-url "$AWAXI_BASE_URL" --s
 node bin/aw-axi.js totals --label "Reading" --base-url "$AWAXI_BASE_URL"
 ```
 
-`--state` (or `AWAXI_STATE`) is required for a command that writes.
+Timer writes and `views add-stopwatch` require `--state` (or `AWAXI_STATE`); native server writes require `--state` explicitly as shown in [Native category rules](#native-category-rules). File exports and legacy file edits do not use the state lock.
 It holds a lock for this CLI only. Locks left after a crash are not removed automatically. Confirm that no command is running before manually removing a stale lock from the chosen state directory.
 ActivityWatch does not provide a transaction that also covers the browser.
 
 ## Commands
 
 - `timer start`, `timer stop`, `timer switch`, and `timer status` use a `general.stopwatch` bucket.
-  The default bucket is `aw-stopwatch` with hostname `unknown`.
+  A single existing stopwatch bucket is selected automatically; use `--bucket` to choose among several. When creating the first bucket, the default is `aw-stopwatch` with hostname `unknown`.
   Stop writes the same event id with `running: false` and the elapsed seconds.
   Starting a label that is already running does nothing.
 - `totals` separates stored completed time from the current running elapsed time.
@@ -53,6 +53,7 @@ ActivityWatch does not provide a transaction that also covers the browser.
 - `uncategorized` needs `--rules` with coverage `complete`, or the explicit `--server-rules` flag. Rule sets and their active selection must be valid and nonempty. App and observed web-tab totals are separate measures and must not be added together. Conflicting bucket hosts require `--host`. An existing AFK bucket must cover the requested range without gaps or overlaps; incomplete coverage and ambiguous overlapping app or domain identities are refused.
   It prints app names and reduced domains only.
 - `rules` previews and edits explicit legacy rule files. The native path below reads, applies, and restores complete native category documents.
+  `rules add` adds a regex alternative to the named category in the selected set. `--ignore-case` and comma-separated `--select-keys` also update existing rules. Repeating an exact stored pattern with unchanged modifiers is a no-op and creates no backup.
 - `views show` reads the server layout.
   `views add-stopwatch` appends one `top_stopwatches` element to the view id you name.
 - `aw-axi --tui --base-url <url>` is a read-only terminal dashboard.
@@ -122,7 +123,7 @@ The verified desktop Activity query categorizes window events. Although its Brow
 
 Native rules are restricted to the exact v0.14.2 backend and webUI build described above. Other command paths use the ActivityWatch API, but acceptance against the latest releases, Windows or Linux, and Rust API-key authentication has not been established. Run `node bin/aw-axi.js <command> --help` for flags and examples.
 
-`npm test` runs the synthetic CLI and TUI tests on Node 24 or newer. The native-rules fault tests additionally require `AWAXI_TEST_WEBUI_BUNDLE` pointing to the verified v0.14.2 webUI JavaScript bundle. The official Rust integration test is macOS-specific and opt-in: set `AWAXI_TEST_SERVER_BIN` and `AWAXI_TEST_WEBPATH` to an installed v0.14.2 Rust server and its web assets. It starts a separate server with a fresh database, a sandbox, and an ephemeral loopback port; it does not use port 5600. It is not a substitute for cross-platform or API-key testing. Test data defaults to a temporary directory; `AWAXI_TEST_DATA` selects an isolated directory. For the macOS official fixture, use a direct child of the canonical `/private/tmp` directory (for example `AWAXI_TEST_DATA=/private/tmp/awaxi-tests`): the fixture allows metadata for `/private`, `/private/tmp` and its own test directories, while keeping content access and network access restricted. Other paths may need a different sandbox policy and are not covered by this validation. Test cases requiring unavailable fixtures are reported as skipped.
+`npm test` runs the synthetic CLI and TUI tests on Node 24 or newer. The TUI terminal-session test also requires `python3` on PATH with Unix PTY support (`pty`, `fcntl`, and `termios`). The native-rules fault tests additionally require `AWAXI_TEST_WEBUI_BUNDLE` pointing to the verified v0.14.2 webUI JavaScript bundle. The official Rust integration test is macOS-specific and opt-in: set `AWAXI_TEST_SERVER_BIN` and `AWAXI_TEST_WEBPATH` to an installed v0.14.2 Rust server and its web assets. It starts a separate server with a fresh database, a sandbox, and an ephemeral loopback port; it does not use port 5600. It is not a substitute for cross-platform or API-key testing. Test data defaults to a temporary directory; `AWAXI_TEST_DATA` selects an isolated directory. The macOS official fixture resolves its run directory to a canonical path and allows metadata access to its ancestor directories; content access and network access remain restricted by the sandbox in [test/official.test.js](test/official.test.js). The native-rules fault tests and official integration test are reported as skipped when their required fixture environment variables are absent.
 
 ## Privacy and recovery
 

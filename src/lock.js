@@ -36,4 +36,3 @@ export async function withLock(stateDir, name, fn) {
     }
   }
 }
-

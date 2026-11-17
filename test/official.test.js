@@ -533,6 +533,10 @@ function freePort() {
 }
 
 function sandbox(port, dataDir) {
+  const parents = [];
+  for (let dir = path.dirname(dataDir); dir !== path.dirname(dir); dir = path.dirname(dir)) {
+    parents.push(`  (literal ${JSON.stringify(dir)})`);
+  }
   return `(version 1)
 (allow default)
 (deny file-read* (require-all
@@ -567,8 +571,6 @@ function sandbox(port, dataDir) {
 (allow file-read-metadata
   (literal "/private")
   (literal "/private/tmp")
-  (literal "/Users")
-  (literal "${evidenceRoot}")
-  (literal "${runsRoot}"))
+${parents.join("\n")})
 `;
 }
