@@ -20,7 +20,7 @@ Commands:
   views show|add-stopwatch
 
 Pass --base-url for every server command. There is no default port.
-Pass --state for a command that writes, so this process can lock itself.
+See README.md's Run section for state-directory and locking requirements.
 \`aw-axi --tui --base-url <url>\` opens the read-only statistics dashboard.
 Run \`aw-axi <command> --help\` for that command.
 This build does not self-update and does not install session hooks.
