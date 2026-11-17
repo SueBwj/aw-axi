@@ -274,3 +274,16 @@ export function selectByType(buckets, type, host) {
   if (host) list = list.filter((bucket) => bucket.hostname === host);
   return list;
 }
+
+export function selectActivityBuckets(buckets, host) {
+  const groups = ["currentwindow", "web.tab.current", "afkstatus"].map((type) => selectByType(buckets, type, host));
+  const selected = groups.flat();
+  if (groups.some((group) => group.length > 1) || new Set(selected.map((bucket) => bucket.hostname ?? null)).size > 1) {
+    throw new AxiError(
+      "Activity buckets are ambiguous or belong to different hosts. Pass --host. No event contents were returned.",
+      "AMBIGUOUS",
+      selected.map((bucket) => `${bucket.id} hostname ${bucket.hostname ?? "unknown"}`),
+    );
+  }
+  return groups;
+}

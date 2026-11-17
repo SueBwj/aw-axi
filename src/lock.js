@@ -13,12 +13,11 @@ export async function withLock(stateDir, name, fn) {
       handle = await open(lockPath, "wx", 0o600);
     } catch (error) {
       if (error.code !== "EEXIST") throw error;
-      await dropStaleLock(lockPath);
       if (Date.now() > deadline) {
         throw new AxiError(
-          "Another activitywatch-axi process holds the local lock.",
+          "An activitywatch-axi lock already exists.",
           "LOCK_HELD",
-          ["Wait for that command to finish, then retry. The server itself was not locked."],
+          ["Wait for that command to finish, then retry. After a crash, confirm no command is running before manually removing the lock. The server itself was not locked."],
         );
       }
       await new Promise((resolve) => setTimeout(resolve, 25));
@@ -38,24 +37,3 @@ export async function withLock(stateDir, name, fn) {
   }
 }
 
-async function dropStaleLock(lockPath) {
-  let text;
-  try {
-    text = await readFile(lockPath, "utf8");
-  } catch {
-    return;
-  }
-  const pid = Number(String(text).split(":")[0]);
-  if (!Number.isInteger(pid) || pid <= 0) return;
-  if (pidAlive(pid)) return;
-  await rm(lockPath, { force: true }).catch(() => {});
-}
-
-function pidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error.code === "EPERM";
-  }
-}

@@ -161,8 +161,30 @@ function validateDocument(doc) {
 
 function validateSettings(settings) {
   if (!object(settings) || Object.keys(settings).length !== 3 || !KEYS.every(k => Object.hasOwn(settings, k))) fail("A complete document contains exactly category_sets, active_set_ids, and classes.");
+  validateCategorySets(settings);
   const { category_sets: sets, active_set_ids: active, classes } = settings;
-  if (!Array.isArray(sets) || !sets.length || !Array.isArray(active) || !active.length || !Array.isArray(classes)) fail("Nonempty native sets and active IDs, plus classes, are required; empty selection would activate a native fallback.");
+  if (!Array.isArray(classes)) fail("Native classes must be a list.");
+  const ordered = active.map(id => sets.find(s => s.id === id));
+  const seen = new Set();
+  const hidden = new Set(ordered[0].tombstones ?? []);
+  const merged = [];
+  ordered.forEach((set, index) => {
+    for (const category of set.categories) {
+      const key = JSON.stringify(category.name);
+      if (seen.has(key) || (index > 0 && hidden.has(key))) continue;
+      seen.add(key);
+      merged.push(category);
+    }
+  });
+  // The supplied compatibility list must reflect native set priority and tombstones.
+  // Do not silently regenerate it and lose unknown fields from either representation.
+  if (!equal(classes, merged)) fail("classes must equal the effective categories in active-set order, including primary tombstones.");
+}
+
+export function validateCategorySets(settings) {
+  if (!object(settings)) fail("Category settings must be an object.");
+  const { category_sets: sets, active_set_ids: active } = settings;
+  if (!Array.isArray(sets) || !sets.length || !Array.isArray(active) || !active.length) fail("Nonempty native sets and active IDs are required; empty selection would activate a native fallback.");
   const ids = new Set();
   for (const set of sets) {
     if (!object(set) || typeof set.id !== "string" || !set.id || ids.has(set.id) || !Array.isArray(set.categories)) fail("Invalid or duplicate native category set.");
@@ -190,21 +212,6 @@ function validateSettings(settings) {
     }
   }
   if (new Set(active).size !== active.length || active.some(id => !ids.has(id))) fail("Active IDs must be unique and refer to supplied sets.");
-  const ordered = active.map(id => sets.find(s => s.id === id));
-  const seen = new Set();
-  const hidden = new Set(ordered[0].tombstones ?? []);
-  const merged = [];
-  ordered.forEach((set, index) => {
-    for (const category of set.categories) {
-      const key = JSON.stringify(category.name);
-      if (seen.has(key) || (index > 0 && hidden.has(key))) continue;
-      seen.add(key);
-      merged.push(category);
-    }
-  });
-  // The supplied compatibility list must reflect native set priority and tombstones.
-  // Do not silently regenerate it and lose unknown fields from either representation.
-  if (!equal(classes, merged)) fail("classes must equal the effective categories in active-set order, including primary tombstones.");
 }
 
 function validName(name) { return Array.isArray(name) && name.length > 0 && name.every(v => typeof v === "string" && v.length > 0); }

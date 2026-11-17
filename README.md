@@ -38,7 +38,7 @@ node bin/aw-axi.js totals --label "Reading" --base-url "$AWAXI_BASE_URL"
 ```
 
 `--state` (or `AWAXI_STATE`) is required for a command that writes.
-It holds a lock for this CLI only.
+It holds a lock for this CLI only. Locks left after a crash are not removed automatically. Confirm that no command is running before manually removing a stale lock from the chosen state directory.
 ActivityWatch does not provide a transaction that also covers the browser.
 
 ## Commands
@@ -50,7 +50,7 @@ ActivityWatch does not provide a transaction that also covers the browser.
 - `totals` separates stored completed time from the current running elapsed time.
   Overlapping stored intervals are counted once.
   Window and AFK time is not added.
-- `uncategorized` needs `--rules` with coverage `complete`, or the explicit `--server-rules` flag.
+- `uncategorized` needs `--rules` with coverage `complete`, or the explicit `--server-rules` flag. Rule sets and their active selection must be valid and nonempty. App and observed web-tab totals are separate measures and must not be added together. Conflicting bucket hosts require `--host`. An existing AFK bucket must cover the requested range without gaps or overlaps; incomplete coverage and ambiguous overlapping app or domain identities are refused.
   It prints app names and reduced domains only.
 - `rules` previews and edits explicit legacy rule files. The native path below reads, applies, and restores complete native category documents.
 - `views show` reads the server layout.

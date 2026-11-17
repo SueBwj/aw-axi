@@ -2,6 +2,7 @@ import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { AxiError } from "axi-sdk-js";
 import { getSetting } from "./client.js";
+import { validateCategorySets } from "./native-rules.js";
 import { revisionOf, stableStringify } from "./revision.js";
 
 const FORMAT = "activitywatch-axi.rules.v1";
@@ -141,9 +142,6 @@ export async function loadCompleteRules(flags, client) {
       );
     }
     const payload = rulesPayload(parsed.value);
-    if (coverageOf(payload) !== "complete") {
-      throw new AxiError("The complete file does not contain category_sets and active_set_ids.", "UNSUPPORTED");
-    }
     return { source: "file", scope: "complete", categories: mergeActive(payload), document: payload };
   }
   if (flags["server-rules"]) {
@@ -173,7 +171,7 @@ async function addFile(file, edit, expect, backup) {
   const parsed = parseDocumentBytes(original, absolute);
   assertExpect(rulesPayload(parsed), expect);
   const next = applyAdd(parsed, edit);
-  if (stableStringify(rulesPayload(parsed)) === stableStringify(rulesPayload(next))) {
+  if (stableStringify(rulesPayload(parsed)) === stableStringify(rulesPayload(next.document))) {
     return { result: "no-op", file: absolute, revision: expect, masked: next.masked };
   }
   const again = await readFile(absolute);
@@ -209,61 +207,47 @@ async function revertFile(file, backup, expect) {
 function applyAdd(document, edit) {
   const next = structuredClone(document);
   const sets = next.category_sets;
-  if (!Array.isArray(sets)) {
-    throw new AxiError("Refusing to invent category_sets.", "UNSUPPORTED");
-  }
-  const set = sets.find((item) => item && item.id === edit.setId);
+  const set = sets.find((item) => item.id === edit.setId);
   if (!set) {
     throw new AxiError(`Category set ${JSON.stringify(edit.setId)} is not in the document.`, "NOT_FOUND", [
-      ...sets.map((item) => `set ${item?.id ?? "unknown"}`),
+      ...sets.map((item) => `set ${item.id}`),
     ]);
   }
-  if (!Array.isArray(set.categories)) {
-    throw new AxiError(`Category set ${JSON.stringify(edit.setId)} has no category list.`, "VALIDATION_ERROR");
-  }
   const key = JSON.stringify(edit.name);
-  const existing = set.categories.find((category) => JSON.stringify(category?.name) === key);
+  const existing = set.categories.find((category) => JSON.stringify(category.name) === key);
   if (!existing) {
     const rule = { type: "regex", regex: edit.pattern };
-    if (edit.ignoreCase) rule.ignore_case = true;
-    if (edit.selectKeys) rule.select_keys = edit.selectKeys;
     set.categories.push({ name: edit.name, rule });
-  } else if (existing.rule?.type === "regex" && alreadyHas(existing.rule.regex, edit.pattern)) {
-    // The requested alternative is already stored.
-  } else if (!existing.rule || existing.rule.type === "none" || existing.rule.type === null) {
-    existing.rule = { ...existing.rule, type: "regex", regex: edit.pattern };
-    if (edit.ignoreCase) existing.rule.ignore_case = true;
-  } else if (existing.rule.type === "regex") {
-    existing.rule = {
-      ...existing.rule,
-      regex: existing.rule.regex ? `${existing.rule.regex}|${edit.pattern}` : edit.pattern,
-    };
-    if (edit.ignoreCase) existing.rule.ignore_case = true;
   } else {
-    throw new AxiError(`Rule type ${existing.rule.type} cannot be extended.`, "UNSUPPORTED");
+    const rule = existing.rule;
+    if (rule.type === "regex") {
+      if (rule.regex !== edit.pattern) rule.regex = `${rule.regex}|${edit.pattern}`;
+    } else {
+      rule.type = "regex";
+      rule.regex = edit.pattern;
+    }
   }
+  const edited = set.categories.find((category) => JSON.stringify(category.name) === key);
+  if (edit.ignoreCase) edited.rule.ignore_case = true;
+  if (edit.selectKeys) edited.rule.select_keys = edit.selectKeys;
   const payload = rulesPayload(next);
-  if (coverageOf(payload) === "complete") payload.classes = mergeActive(payload).map(cloneCategory);
+  const merged = mergeActive(payload);
+  payload.classes = merged.map((category) => structuredClone(category));
   next.classes = payload.classes;
-  const winner = mergeActive(payload).find((category) => JSON.stringify(category.name) === key);
-  const edited = set.categories.find((category) => JSON.stringify(category?.name) === key);
-  const masked = Boolean(winner && edited && winner !== edited);
+  const winner = merged.find((category) => JSON.stringify(category.name) === key);
+  const masked = Boolean(winner && winner !== edited);
   return { document: next, masked };
 }
 
-function cloneCategory(category) {
-  return structuredClone(category);
-}
-
 export function mergeActive(document) {
-  const ordered = orderedSets(document);
-  if (!ordered) return [];
+  validateCategorySets(document);
+  const ordered = document.active_set_ids.map((id) => document.category_sets.find((set) => set.id === id));
   const seen = new Set();
-  const hidden = new Set(Array.isArray(ordered[0]?.tombstones) ? ordered[0].tombstones : []);
+  const hidden = new Set(ordered[0].tombstones ?? []);
   const merged = [];
   ordered.forEach((set, index) => {
-    for (const category of set.categories ?? []) {
-      const key = JSON.stringify(category?.name);
+    for (const category of set.categories) {
+      const key = JSON.stringify(category.name);
       if (seen.has(key)) continue;
       if (index > 0 && hidden.has(key)) continue;
       seen.add(key);
@@ -271,13 +255,6 @@ export function mergeActive(document) {
     }
   });
   return merged;
-}
-
-function orderedSets(document) {
-  if (!Array.isArray(document.category_sets) || !Array.isArray(document.active_set_ids)) return null;
-  return document.active_set_ids
-    .map((id) => document.category_sets.find((set) => set && set.id === id))
-    .filter(Boolean);
 }
 
 function rulesPayload(document) {
@@ -289,7 +266,14 @@ function rulesPayload(document) {
 }
 
 export function coverageOf(document) {
-  if (Array.isArray(document?.category_sets) && Array.isArray(document?.active_set_ids)) return "complete";
+  if (document?.category_sets != null || document?.active_set_ids != null) {
+    try {
+      validateCategorySets(document);
+      return "complete";
+    } catch {
+      return "unsupported";
+    }
+  }
   if (document?.category_sets == null && Array.isArray(document?.classes)) return "legacy-classes-only";
   return "unsupported";
 }
@@ -348,13 +332,6 @@ function parseEdit(flags) {
   return { setId: flags.set, name, pattern: flags.pattern, ignoreCase: Boolean(flags["ignore-case"]), selectKeys };
 }
 
-function alreadyHas(regex, pattern) {
-  if (typeof regex !== "string") return false;
-  if (regex === pattern) return true;
-  if (pattern.includes("|")) return false;
-  return regex.split("|").includes(pattern);
-}
-
 async function readServerRules(client) {
   const [categorySets, activeIds, classes] = await Promise.all([
     getSetting(client, "category_sets"),
@@ -381,7 +358,10 @@ async function readRulesFile(file) {
     throw new AxiError("The rules file is not JSON. It was not modified.", "VALIDATION_ERROR");
   }
   if (Array.isArray(value)) return { kind: "array", value };
-  if (value && typeof value === "object" && value.format === FORMAT) return { kind: "document", value };
+  if (value && typeof value === "object" && value.format === FORMAT) {
+    if (value.coverage === "complete" || value.coverage === "server-sets") validateCategorySets(value);
+    return { kind: "document", value };
+  }
   return { kind: "other", value };
 }
 
@@ -405,6 +385,7 @@ function parseDocumentBytes(bytes, file) {
       "UNSUPPORTED",
     );
   }
+  validateCategorySets(value);
   return value;
 }
 

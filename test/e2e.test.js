@@ -511,7 +511,7 @@ await check("uncategorized output keeps canaries out", async () => {
     assert.doesNotMatch(result.stdout, /user:pass/);
     assert.doesNotMatch(result.stdout, /Notes/);
     assert.doesNotMatch(result.stdout, /example\.com/);
-    assert.doesNotMatch(result.stdout, /Google Chrome/);
+    assert.match(result.stdout, /Google Chrome,60/);
     assert.ok(server.state.requests.some((request) => request.method === "POST" && request.path === "/api/0/query/"));
     assert.equal(server.state.requests.some((request) => request.path === "/api/0/query"), false);
     const missing = await run([
@@ -1073,8 +1073,8 @@ function seedActivity(state) {
     hostname: "synthetic",
   };
   state.events["aw-watcher-window_synthetic"] = [
-    event(1, start, 20, { app: "Notes", title: "CANARY_TITLE_SECRET" }),
-    event(2, start, 100, { app: "Mystery", title: "CANARY_TITLE_SECRET" }),
+    event(1, start, 10, { app: "Notes", title: "CANARY_TITLE_SECRET" }),
+    event(2, "2026-11-15T00:00:10.000Z", 100, { app: "Mystery", title: "CANARY_TITLE_SECRET" }),
     event(3, "2026-11-15T00:03:20.000Z", 30, { app: "Google Chrome", title: "CANARY_TITLE_SECRET" }),
     event(4, "2026-11-15T00:05:00.000Z", 30, { app: "Google Chrome", title: "CANARY_TITLE_SECRET" }),
   ];

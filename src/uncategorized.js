@@ -1,5 +1,5 @@
 import { AxiError } from "axi-sdk-js";
-import { getBuckets, queryBucket, selectByType } from "./client.js";
+import { getBuckets, queryBucket, selectActivityBuckets } from "./client.js";
 import { nowFrom } from "./options.js";
 import { loadCompleteRules } from "./rules.js";
 import { formatInstant, intersect, rangeFrom, secondsFromMs, timeZoneFrom } from "./time.js";
@@ -11,16 +11,7 @@ export async function uncategorized(flags, client) {
   const timeZone = timeZoneFrom(flags);
   const range = rangeFrom(flags, now, timeZone);
   const buckets = await getBuckets(client);
-  const windows = selectByType(buckets, "currentwindow", flags.host);
-  const webs = selectByType(buckets, "web.tab.current", flags.host);
-  const afks = selectByType(buckets, "afkstatus", flags.host);
-  if (windows.length > 1 || webs.length > 1 || afks.length > 1) {
-    throw new AxiError(
-      "More than one window, web, or AFK bucket matches. Pass --host. No event contents were returned.",
-      "AMBIGUOUS",
-      [...windows, ...webs, ...afks].map((bucket) => `${bucket.id} hostname ${bucket.hostname ?? "unknown"}`),
-    );
-  }
+  const [windows, webs, afks] = selectActivityBuckets(buckets, flags.host);
   const header = {
     timezone: timeZone,
     start: formatInstant(range.start, timeZone),
@@ -44,19 +35,14 @@ export async function uncategorized(flags, client) {
   const notAfk = afks.length === 0 ? null : await notAfkIntervals(client, afks[0], range);
   const windowPieces = await piecesFrom(client, windows[0], range, notAfk);
   const webPieces = await piecesFrom(client, webs[0], range, notAfk);
-  const remainders = windowPieces.flatMap((piece) => subtract(piece, webPieces));
-  const appPieces = remainders
-    .filter((piece) => !categorized(piece.event, loaded.categories))
-    .map((piece) => ({ ...piece, key: appName(piece.event) }));
-  const domainPieces = webPieces
-    .filter((piece) => !categorized(piece.event, loaded.categories))
-    .map((piece) => ({ ...piece, key: domainName(piece.event) }));
+  const appPieces = windowPieces.map((piece) => ({ ...piece, key: appName(piece.event), categorized: categorized(piece.event, loaded.categories) }));
+  const domainPieces = webPieces.map((piece) => ({ ...piece, key: domainName(piece.event), categorized: categorized(piece.event, loaded.categories) }));
   const apps = rows(allocate(appPieces), "name");
   const domains = rows(allocate(domainPieces), "domain");
   return {
     ...header,
     afk_filter: notAfk ? "applied" : "unavailable",
-    overlap: "overlapping time is counted once",
+    overlap: "same-identity overlaps count once; ambiguous attribution is refused; app and domain measures are separate",
     apps_count: apps.length,
     apps: apps.length === 0 ? "0 uncategorized apps in this range" : apps,
     domains_count: domains.length,
@@ -94,6 +80,14 @@ async function notAfkIntervals(client, bucket, range) {
       );
     }
   }
+  let coveredUntil = range.start.epochMilliseconds;
+  for (const interval of intervals) {
+    if (interval.start > coveredUntil) break;
+    coveredUntil = interval.end;
+  }
+  if (coveredUntil < range.end.epochMilliseconds) {
+    throw new AxiError("AFK coverage is incomplete for this range. No app or domain totals were returned.", "INCOMPLETE");
+  }
   return intervals.filter((interval) => interval.status === "not-afk");
 }
 
@@ -113,23 +107,6 @@ function clipEvent(event, range, notAfk) {
     .filter(Boolean);
 }
 
-function subtract(piece, covers) {
-  let parts = [{ start: piece.start, end: piece.end }];
-  for (const cover of covers) {
-    const next = [];
-    for (const part of parts) {
-      if (cover.end <= part.start || cover.start >= part.end) {
-        next.push(part);
-        continue;
-      }
-      if (cover.start > part.start) next.push({ start: part.start, end: Math.min(cover.start, part.end) });
-      if (cover.end < part.end) next.push({ start: Math.max(cover.end, part.start), end: part.end });
-    }
-    parts = next;
-  }
-  return parts.filter((part) => part.end > part.start).map((part) => ({ ...part, event: piece.event }));
-}
-
 function allocate(pieces) {
   const points = new Set();
   for (const piece of pieces) {
@@ -143,7 +120,10 @@ function allocate(pieces) {
     const end = sorted[index + 1];
     const active = pieces.filter((piece) => piece.start <= start && piece.end >= end);
     if (active.length === 0) continue;
-    active.sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    if (active.some((piece) => piece.key !== active[0].key || piece.categorized !== active[0].categorized)) {
+      throw new AxiError("Overlapping activity has ambiguous attribution. No app or domain totals were returned.", "INCOMPLETE");
+    }
+    if (active[0].categorized) continue;
     const key = active[0].key;
     totals.set(key, (totals.get(key) ?? 0) + (end - start));
   }
@@ -158,7 +138,7 @@ function rows(totals, field) {
 
 function compileRules(categories) {
   for (const category of categories) {
-    if (!category?.rule || category.rule.type !== "regex" || !category.rule.regex) continue;
+    if (!category?.rule || category.rule.type !== "regex") continue;
     try {
       category.compiled = new RegExp(category.rule.regex, `${category.rule.ignore_case ? "i" : ""}m`);
     } catch {

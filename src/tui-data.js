@@ -1,5 +1,5 @@
 import { AxiError } from "axi-sdk-js";
-import { getBuckets, getEvents, getSetting, queryBucket, selectByType } from "./client.js";
+import { getBuckets, getEvents, getSetting, queryBucket, selectActivityBuckets } from "./client.js";
 import { clientFrom, nowFrom } from "./options.js";
 import { instantFromDate, intersect, rangeFrom, timeZoneFrom, unionMs } from "./time.js";
 
@@ -207,16 +207,7 @@ export async function loadDashboard(flags, client, mode = "today") {
   const range = tuiRange(flags, now, timeZone, mode);
   const anchor = range.end.toZonedDateTimeISO(timeZone);
   const buckets = await getBuckets(client);
-  const windows = selectByType(buckets, "currentwindow", flags.host);
-  const webs = selectByType(buckets, "web.tab.current", flags.host);
-  const afks = selectByType(buckets, "afkstatus", flags.host);
-  if (windows.length > 1 || webs.length > 1 || afks.length > 1) {
-    throw new AxiError(
-      "More than one window, web, or AFK bucket matches. Pass --host. No event contents were returned.",
-      "AMBIGUOUS",
-      [...windows, ...webs, ...afks].map((bucket) => `${bucket.id} hostname ${bucket.hostname ?? "unknown"}`),
-    );
-  }
+  const [windows, webs, afks] = selectActivityBuckets(buckets, flags.host);
   const startMs = range.start.epochMilliseconds;
   const endMs = range.end.epochMilliseconds;
   const windowEvents = windows[0] ? await queryBucket(client, windows[0].id, range.start, range.end) : null;

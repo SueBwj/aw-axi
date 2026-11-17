@@ -62,6 +62,8 @@ Flags:
 The default range is the last seven local days, ending now.
 Titles, full URLs, and raw events are not printed.
 A partial or missing rule file is refused instead of reported as uncategorized.
+App and observed web-tab totals are separate measures; do not add them together.
+Conflicting hosts require --host. Gaps in an existing AFK bucket and ambiguous activity overlaps are refused.
 `,
   rules: `rules show|export|preview|add|apply|revert
 Explicit category-rule documents. Browser profiles are not searched.

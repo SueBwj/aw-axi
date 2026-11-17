@@ -104,7 +104,7 @@ async function live(flags) {
   let scroll = 0;
   let view = { ok: false, message: "Reading the current range." };
   let refreshing = false;
-  let generation = 0;
+  let pending = false;
   let closed = false;
   stdin.setRawMode(true);
   stdin.resume();
@@ -129,22 +129,30 @@ async function live(flags) {
     stdout.write(`\u001b[H\u001b[2J${paintDashboard(framed.text, colorEnabled(stdout))}`);
   };
   const refresh = () => {
-    if (refreshing || closed) return;
+    if (closed) return;
+    if (refreshing) {
+      pending = true;
+      return;
+    }
     refreshing = true;
-    const token = ++generation;
     dashboardFrom(flags, mode).then(
       (model) => {
-        if (token !== generation || closed) return;
+        if (pending || closed) return;
         view = model;
       },
       (error) => {
-        if (token !== generation || closed) return;
+        if (pending || closed) return;
         view = errorModel(error);
       },
     ).finally(() => {
-      if (token !== generation || closed) return;
       refreshing = false;
-      paint();
+      if (closed) return;
+      if (pending) {
+        pending = false;
+        refresh();
+      } else {
+        paint();
+      }
     });
   };
   const onData = (chunk) => {
