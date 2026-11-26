@@ -1,0 +1,21 @@
+{
+  "name": "activitywatch-axi",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MPL-2.0",
+  "description": "Local CLI for ActivityWatch timers, totals, uncategorized time, category rules, and dashboard settings.",
+  "type": "module",
+  "bin": {
+    "aw-axi": "./bin/aw-axi.js"
+  },
+  "scripts": {
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "axi-sdk-js": "0.1.14",
+    "temporal-polyfill": "1.0.8"
+  }
+}
