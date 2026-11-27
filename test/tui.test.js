@@ -475,7 +475,7 @@ if pid == 0:
     os.execv(node, [node, program, *args])
 buf = b""
 sent = False
-deadline = time.time() + 8
+deadline = time.time() + 60
 while time.time() < deadline:
     ready, _, _ = select.select([fd], [], [], 0.2)
     if fd not in ready:

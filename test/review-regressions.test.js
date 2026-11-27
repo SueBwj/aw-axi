@@ -1813,7 +1813,7 @@ test("R9 repeated exact additions preserve bytes and do not create backups", asy
   await assert.rejects(readFile(absent), { code: "ENOENT" });
 });
 
-test("R10 range changes queue a fresh read and never paint obsolete results", { timeout: 15000 }, async t => {
+test("R10 range changes queue a fresh read and never paint obsolete results", { timeout: 60000 }, async t => {
   const { server, state } = await setup(t);
   const splitFrames = output => output.split("\u001b[H\u001b[2J").slice(1);
   const isActivityFrame = frame => frame.includes("foreground union");

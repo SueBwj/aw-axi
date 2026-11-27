@@ -57,6 +57,7 @@ ActivityWatch does not provide a transaction that also covers the browser.
   It prints app names and reduced domains only.
 - `rules` previews and edits explicit legacy rule files. The native path below reads, applies, and restores complete native category documents.
   `rules add` adds a regex alternative to the named category in the selected set. `--ignore-case` and comma-separated `--select-keys` also update existing rules. Repeating an exact stored pattern with unchanged modifiers is a no-op and creates no backup.
+  Appending an alternative is refused if either pattern contains a backreference. File edits require verifiable plain permissions on the resolved file and staging directory; unsupported permission metadata is refused before replacement.
 - `views show` reads the server layout.
   `views add-stopwatch` appends one `top_stopwatches` element to the view id you name.
 - `aw-axi --tui --base-url <url>` is a read-only terminal dashboard.
