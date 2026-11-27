@@ -228,8 +228,36 @@ test("timer start requires an acknowledged timestamp without retrying the write"
   assert.equal(stopped.code, 0, stopped.stdout);
   state.faults.eventReply = [{ id: id + 1 }];
   const switched = await timer("switch", "--from", "Absent", "--to", "Next");
-  assert.equal(switched.code, 0, switched.stdout);
+  assert.match(switched.stdout, /code: UNCERTAIN_WRITE/);
+  assert.doesNotMatch(switched.stdout, /result: switched/);
   assert.equal(state.eventPosts, id + 2);
+});
+
+test("timer switch verifies start acknowledgments after stopping a source", async t => {
+  const { dir, server, state } = await setup(t);
+  const bucket = "aw-stopwatch";
+  state.buckets[bucket] = { id: bucket, type: "general.stopwatch" };
+  const timer = () => run(["timer", "switch", "--from", "Previous", "--to", "Next", "--state", dir,
+    "--base-url", server.baseUrl, "--now", "2026-11-15T00:01:00Z"]);
+  for (const timestamp of [undefined, "2026-11-15T00:02:00Z", "2026-11-15T08:01:00+08:00"]) {
+    state.events[bucket] = [{ ...event(0, { label: "Previous", running: true }), id: 1 }];
+    state.nextId = 2;
+    state.faults.eventReply = [{ id: 1, timestamp }];
+    const posts = state.eventPosts;
+    const result = await timer();
+    assert.equal(state.eventPosts, posts + 2);
+    assert.equal(state.events[bucket][0].data.running, false);
+    assert.equal(state.events[bucket][1].data.running, true);
+    if (timestamp === "2026-11-15T08:01:00+08:00") {
+      assert.equal(result.code, 0, result.stdout);
+      assert.match(result.stdout, /result: switched/);
+    } else {
+      assert.match(result.stdout, /code: PARTIAL/);
+      assert.match(result.stdout, /verifiable event timestamp/);
+      assert.match(result.stdout, /timer status/);
+      assert.doesNotMatch(result.stdout, /result: switched/);
+    }
+  }
 });
 
 test("timer updates refuse inexact numbers in existing event data before writing", async t => {

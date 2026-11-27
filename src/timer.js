@@ -237,6 +237,7 @@ export async function timerSwitch(flags, client) {
           data: { label: to, running: true },
         },
       ]);
+      acknowledgedTimestamp(saved[0], now);
       return {
         result: "switched",
         bucket: bucketId,
