@@ -709,10 +709,22 @@ test("review legacy preview can inspect stale selections without enabling their 
   assert.notEqual((await run(["rules", "preview", "--file", backup, "--full"])).code, 0);
 });
 
-test("review fully classified app and domain overlaps do not affect uncategorized totals", async t => {
+test("fully classified overlaps preserve app and domain identity", async t => {
   const { activity, state } = await setup(t);
-  state.events.window = [event(60, { app: "Notes" }), event(60, { app: "Editor", title: "Notes" })];
-  state.events.web = [event(60, { url: "https://first.test", title: "Notes" }), event(60, { url: "https://second.test", title: "Notes" })];
+  for (const [bucket, events] of [
+    ["window", [event(60, { app: "Notes" }), event(60, { app: "Editor", title: "Notes" })]],
+    ["web", [event(60, { url: "https://first.test", title: "Notes" }), event(60, { url: "https://second.test", title: "Notes" })]],
+  ]) {
+    state.events.window = [];
+    state.events.web = [];
+    state.events[bucket] = events;
+    const refused = await activity();
+    assert.notEqual(refused.code, 0, refused.stdout);
+    assert.match(refused.stdout, /INCOMPLETE/);
+    assert.doesNotMatch(refused.stdout, /apps_count|domains_count/);
+  }
+  state.events.window = [event(60, { app: "Notes" }), event(60, { app: "Notes" })];
+  state.events.web = [event(60, { url: "https://first.test/a", title: "Notes" }), event(60, { url: "https://first.test/b", title: "Notes" })];
   const result = await activity();
   assert.equal(result.code, 0, result.stdout);
   assert.match(result.stdout, /apps_count: 0/);

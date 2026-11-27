@@ -37,8 +37,8 @@ export async function uncategorized(flags, client) {
   const notAfk = afks.length === 0 ? null : await notAfkIntervals(client, afks[0], range);
   const windowPieces = await piecesFrom(client, windows[0], range, notAfk);
   const webPieces = await piecesFrom(client, webs[0], range, notAfk);
-  const appPieces = windowPieces.map((piece) => ({ ...piece, key: categorized(piece.event, loaded.categories) ? null : appName(piece.event) }));
-  const domainPieces = webPieces.map((piece) => ({ ...piece, key: categorized(piece.event, loaded.categories) ? null : domainName(piece.event) }));
+  const appPieces = attributionPieces(windowPieces, loaded.categories, appName);
+  const domainPieces = attributionPieces(webPieces, loaded.categories, domainName);
   const allowed = notAfk?.map((interval) => ({ ...interval, key: NOT_AFK }));
   const apps = rows(allocate(appPieces, range, allowed), "name");
   const domains = rows(allocate(domainPieces, range, allowed), "domain");
@@ -51,6 +51,16 @@ export async function uncategorized(flags, client) {
     domains_count: domains.length,
     domains: domains.length === 0 ? "0 uncategorized domains in this range" : domains,
   };
+}
+
+function attributionPieces(pieces, categories, identityOf) {
+  const categorizedKeys = new Map();
+  return pieces.map((piece) => {
+    const identity = identityOf(piece.event);
+    if (!categorized(piece.event, categories)) return { ...piece, key: identity };
+    if (!categorizedKeys.has(identity)) categorizedKeys.set(identity, Symbol(identity));
+    return { ...piece, key: categorizedKeys.get(identity) };
+  });
 }
 
 async function piecesFrom(client, bucket, range, notAfk) {
