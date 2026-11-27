@@ -1,4 +1,4 @@
-import { clipDisplay, displayWidth, formatDuration, padDisplay } from "./tui-data.js";
+import { clipDisplay, displayWidth, formatDuration, padDisplay, sanitizeTerminal } from "./tui-data.js";
 
 const TONES = {
   plain: "",
@@ -9,7 +9,8 @@ const TONES = {
 };
 
 export function renderDashboard(model, { columns = 80 } = {}) {
-  const width = Math.max(20, columns);
+  const width = Math.max(1, columns);
+  if (model?.loading) return clipDisplay(`Reading ${rangeLabel(model.mode)}…`, width);
   const lines = model?.ok ? board(model, width) : errorBoard(model, width);
   return lines.join("\n");
 }
@@ -19,20 +20,20 @@ export function paintDashboard(text, color) {
   return text.split("\n").map((line) => paint(line)).join("\n");
 }
 
-export function frameDashboard(text, { rows = 24, scroll = 0 } = {}) {
+export function frameDashboard(text, { columns = 80, rows = 24, scroll = 0 } = {}) {
   const lines = text.split("\n");
   const hint = lines.at(-1) ?? "";
   const body = lines.slice(0, -1);
-  const height = Math.max(4, rows);
-  const room = Math.max(1, height - 2);
+  if (rows <= 1) return { text: hint, offset: 0, hidden: body.length };
+  const showStatus = rows >= 3;
+  const room = rows - (showStatus ? 2 : 1);
   const offset = Math.max(0, Math.min(scroll, Math.max(0, body.length - room)));
   const slice = body.slice(offset, offset + room);
   while (slice.length < room) slice.push("");
   const above = offset > 0 ? `↑ ${offset} more` : "";
   const below = offset + room < body.length ? `↓ ${body.length - (offset + room)} more` : "";
-  const width = Math.max(20, ...lines.map((line) => displayWidth(line)));
-  const status = clipDisplay([above, below].filter(Boolean).join("  "), width);
-  return { text: [...slice, status, hint].join("\n"), offset, hidden: Math.max(0, body.length - room) };
+  if (showStatus) slice.push(clipDisplay([above, below].filter(Boolean).join("  "), columns));
+  return { text: [...slice, hint].join("\n"), offset, hidden: Math.max(0, body.length - room) };
 }
 
 function board(model, width) {
@@ -75,7 +76,7 @@ function errorBoard(model, width) {
     ...wrap(message, width),
     ...detail.flatMap((line) => wrap(line, width)),
     "",
-    "No activity totals are shown for this failed read.",
+    ...wrap("No activity totals are shown for this failed read.", width),
     "",
     clipHint("r refresh  ·  q quit", width),
   ];
@@ -120,8 +121,10 @@ function timerCard(timers) {
   }
   if (timers.rows.length === 0) lines.push("No timer time in this range.");
   for (const row of timers.rows) {
-    if (row.running > 0) lines.push(`${clipDisplay(row.label, 24)}  running ${formatDuration(row.running)}`);
-    if (row.stored > 0) lines.push(`${clipDisplay(row.label, 24)}  stored ${formatDuration(row.stored)}`);
+    const label = sanitizeTerminal(row.label);
+    const name = clipDisplay(label.trim() ? label : "(unnamed)", 24);
+    if (row.running > 0) lines.push(`${name}  running ${formatDuration(row.running)}`);
+    if (row.stored > 0) lines.push(`${name}  stored ${formatDuration(row.stored)}`);
   }
   if (timers.invalid) lines.push("Some timer events had no single-line label.");
   lines.push(timers.reason);
@@ -141,7 +144,8 @@ function listCard(title, measure, data, absentText) {
   lines.push(metric("union", formatDuration(data.union)));
   const scale = data.union || 1;
   for (const row of data.rows) {
-    const name = clipDisplay(row.key, 22);
+    const label = sanitizeTerminal(row.key);
+    const name = clipDisplay(label.trim() ? label : "(unnamed)", 22);
     const bar = thinBar(row.ms / scale, 16);
     lines.push(`${padDisplay(name, 22, "start")} ${bar} ${formatDuration(row.ms)}`);
   }
@@ -183,7 +187,8 @@ function stack(cards, width) {
 }
 
 function fit(lines, width) {
-  const inner = Math.max(8, width - 4);
+  if (width < 5) return lines.flatMap((line) => wrap(line, width));
+  const inner = width - 4;
   const boxed = ["┌" + "─".repeat(inner + 2) + "┐"];
   for (const line of lines) {
     for (const wrapped of wrap(line, inner)) boxed.push(`│ ${padDisplay(wrapped, inner, "start")} │`);

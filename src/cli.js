@@ -20,6 +20,7 @@ Commands:
   views show|add-stopwatch
 
 Pass --base-url for every server command. There is no default port.
+Commands that take --now also accept AWAXI_NOW as an ISO 8601 date-time.
 See README.md's Run section for state-directory and locking requirements.
 \`aw-axi --tui --base-url <url>\` opens the read-only statistics dashboard.
 Run \`aw-axi <command> --help\` for that command.
@@ -37,6 +38,7 @@ aw-axi timer status --base-url <url>
 
 Flags:
   --label --id --from --to --base-url --bucket --now --state
+--now (or AWAXI_NOW) accepts an ISO 8601 date-time, for example 2026-11-15T00:00:00Z.
 Starting the label that is already running is a no-op.
 A lost write response is not sent again.
 `,
@@ -48,6 +50,7 @@ aw-axi totals --label <label> --start 2026-11-15T00:00:00 --end 2026-11-16T00:00
 
 Flags:
   --label --start --end --timezone --base-url --bucket --now
+--now (or AWAXI_NOW) accepts an ISO 8601 date-time, for example 2026-11-15T00:00:00Z.
 --end is exclusive. Overlapping stored intervals count once.
 Window and AFK time is not added.
 `,
@@ -59,6 +62,7 @@ aw-axi uncategorized --server-rules --base-url <url>
 
 Flags:
   --rules --server-rules --start --end --timezone --host --base-url --now
+--now (or AWAXI_NOW) accepts an ISO 8601 date-time, for example 2026-11-15T00:00:00Z.
 The default range is the last seven local days, ending now.
 Titles, full URLs, and raw events are not printed.
 A partial or missing rule file is refused instead of reported as uncategorized.
@@ -74,6 +78,7 @@ aw-axi rules preview --file <path>
 aw-axi rules add --file <path> --set <id> --name <A>B> --pattern <regex> --expect <revision> --backup <path>
 aw-axi rules revert --file <path> --backup <path> --expect <revision>
 
+For legacy file edits, use the file revision from rules preview --file.
 Flags:
   --file --server --set --name --pattern --ignore-case --select-keys
   --expect --backup --base-url --state --full
@@ -262,7 +267,7 @@ async function rulesCommand(args) {
       flags: { file: "string", server: "boolean", "base-url": "string", state: "string", expect: "string", backup: "string", initialize: "boolean" },
       required: ["file", "server", "base-url", "state", "expect", "backup"],
     });
-    return nativeApply(flags, clientFrom(flags));
+    return nativeApply(flags, clientFrom(flags, undefined, { closeConnection: true }));
   }
   if (sub === "add") {
     const flags = parseArgs(rest, {
@@ -282,14 +287,14 @@ async function rulesCommand(args) {
       },
       required: ["set", "name", "pattern", "expect", "backup"],
     });
-    return rulesAdd(flags, flags.server ? clientFrom(flags) : null);
+    return rulesAdd(flags);
   }
   if (sub === "revert") {
     const flags = parseArgs(rest, {
       command: "rules revert",
       flags: {
         native: "boolean",
-        "save-backup": "string",
+        ...(rest.includes("--native") ? { "save-backup": "string" } : {}),
         file: "string",
         server: "boolean",
         backup: "string",
@@ -299,7 +304,7 @@ async function rulesCommand(args) {
       },
       required: ["backup", "expect"],
     });
-    return flags.native ? nativeApply(flags, clientFrom(flags), true) : rulesRevert(flags, flags.server ? clientFrom(flags) : null);
+    return flags.native ? nativeApply(flags, clientFrom(flags, undefined, { closeConnection: true }), true) : rulesRevert(flags);
   }
   throw new AxiError("rules needs show, export, preview, add, apply, or revert", "VALIDATION_ERROR", [
     "Run `aw-axi rules --help`",

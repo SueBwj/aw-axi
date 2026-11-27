@@ -14,5 +14,9 @@ export function stableStringify(value) {
 }
 
 export function revisionOf(value) {
-  return createHash("sha256").update(stableStringify(value)).digest("hex");
+  return revisionOfBytes(stableStringify(value));
+}
+
+export function revisionOfBytes(bytes) {
+  return createHash("sha256").update(bytes).digest("hex");
 }

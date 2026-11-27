@@ -50,9 +50,11 @@ function timeRuntimeError(error) {
 }
 
 export function localToInstant(input, timeZone) {
-  if (/[zZ]$|[+-]\d{2}:?\d{2}$/.test(input)) {
+  const [dateTime] = input.split("[", 1);
+  const [, clock] = dateTime.split(/[Tt ]/, 2);
+  if (/[zZ]$/.test(dateTime) || (clock && /[+\-\u2212]/.test(clock)) || /\[(?!!?u-ca=)/i.test(input)) {
     throw new AxiError(
-      `--start and --end are local times in --timezone, without an offset`,
+      `--start and --end are local times in --timezone, without an offset or timezone annotation`,
       "VALIDATION_ERROR",
       ["Example: --start 2026-11-15T00:00:00 --timezone Asia/Taipei"],
     );
@@ -124,6 +126,23 @@ export function intersect(start, end, boundStart, boundEnd) {
   const hi = Math.min(end, boundEnd);
   if (hi <= lo) return null;
   return { start: lo, end: hi };
+}
+
+export function sweepIntervals(intervals, start, end, visit) {
+  const changes = intervals.flatMap(({ start, end, key }) => [
+    { at: start, key, delta: 1 },
+    { at: end, key, delta: -1 },
+  ]).sort((a, b) => a.at - b.at);
+  const active = new Map();
+  let cursor = start;
+  for (const { at, key, delta } of changes) {
+    if (at > cursor) visit(at - cursor, active);
+    const count = (active.get(key) ?? 0) + delta;
+    if (count === 0) active.delete(key);
+    else active.set(key, count);
+    cursor = at;
+  }
+  if (end > cursor) visit(end - cursor, active);
 }
 
 export function unionMs(intervals) {

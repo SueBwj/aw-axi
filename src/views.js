@@ -1,9 +1,8 @@
-import { readFile, writeFile } from "node:fs/promises";
-import path from "node:path";
+import { writeFile } from "node:fs/promises";
 import { AxiError } from "axi-sdk-js";
 import { getSetting, putSetting } from "./client.js";
 import { withLock } from "./lock.js";
-import { stateDirFrom } from "./options.js";
+import { absolutePath, stateDirFrom } from "./options.js";
 import { revisionOf, stableStringify } from "./revision.js";
 
 const BACKUP_FORMAT = "activitywatch-axi.views-backup.v1";
@@ -50,8 +49,8 @@ export async function addStopwatch(flags, client) {
   if (!/^[a-f0-9]{64}$/.test(expect ?? "")) {
     throw new AxiError("--expect must be the current sha256 revision", "VALIDATION_ERROR");
   }
-  const backup = path.resolve(flags.backup ?? "");
   if (!flags.backup) throw new AxiError("--backup is required", "VALIDATION_ERROR");
+  const backup = absolutePath(flags.backup);
   const stateDir = stateDirFrom(flags);
   return withLock(stateDir, "settings", async () => {
     const views = await getSetting(client, "views");
@@ -87,30 +86,31 @@ export async function addStopwatch(flags, client) {
     if (target.elements.some((element) => element?.type === "top_stopwatches")) {
       return { result: "no-op", id: flags.id, revision: actual, top_stopwatches: true };
     }
-    const again = await getSetting(client, "views");
-    if (revisionOf(again) !== expect) {
-      throw new AxiError("Views changed after they were read. Nothing was written.", "CONFLICT");
-    }
-    const next = again.map((view) => {
-      if (view !== target && view?.id !== flags.id) return view;
-      if (view?.id !== flags.id) return view;
+    const next = views.map((view) => {
+      if (view !== target) return view;
       return {
         ...view,
         elements: [...view.elements, { type: "top_stopwatches", props: {} }],
       };
     });
-    if (next.filter((view) => view?.id === flags.id).length !== 1) {
-      throw new AxiError("The selected view was no longer unique. Nothing was written.", "AMBIGUOUS");
-    }
     await writeNewFile(
       backup,
-      `${JSON.stringify({ format: BACKUP_FORMAT, revision: expect, views: again }, null, 2)}\n`,
+      `${JSON.stringify({ format: BACKUP_FORMAT, revision: expect, views }, null, 2)}\n`,
     );
-    await putSetting(client, "views", next);
-    const confirmed = await getSetting(client, "views");
+    const again = await getSetting(client, "views");
+    if (revisionOf(again) !== expect) {
+      throw new AxiError("Views changed after they were read. No server settings were written.", "CONFLICT");
+    }
+    let confirmed;
+    try {
+      await putSetting(client, "views", next);
+      confirmed = await getSetting(client, "views").catch(() => undefined);
+    } catch (error) {
+      if (!(error instanceof AxiError) || error.code !== "UNCERTAIN_WRITE") throw error;
+    }
     if (stableStringify(confirmed) !== stableStringify(next)) {
       throw new AxiError(
-        "Views do not match the write that was sent. It was not retried.",
+        "The views write could not be confirmed. It was not retried.",
         "UNCERTAIN_WRITE",
         [`Backup: ${backup}`, "Run `aw-axi views show --base-url <url>` before another edit."],
       );
@@ -145,8 +145,4 @@ async function writeNewFile(file, contents) {
     }
     throw error;
   }
-}
-
-export async function readViewsBackup(file) {
-  return JSON.parse(await readFile(file, "utf8"));
 }

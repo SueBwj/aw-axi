@@ -1,3 +1,4 @@
+import { emitKeypressEvents } from "node:readline";
 import { AxiError, exitCodeForError } from "axi-sdk-js";
 import { parseArgs } from "./args.js";
 import { dashboardFrom, rangeModeAllowed, sanitizeTerminal } from "./tui-data.js";
@@ -16,6 +17,7 @@ aw-axi --tui --base-url <url> --once
 
 Flags:
   --base-url --host --bucket --start --end --timezone --now --once
+--now (or AWAXI_NOW) accepts an ISO 8601 date-time, for example 2026-11-15T00:00:00Z.
 --base-url is required. There is no default port.
 The default range is today in --timezone, ending at the refresh anchor. --end is exclusive.
 t and 7 switch today and the last seven days. An explicit range does not offer those keys.
@@ -41,28 +43,27 @@ export async function runTui(argv) {
 }
 
 async function dispatchTui(argv) {
-  if (argv.includes("--help") || argv.includes("-h")) {
+  const flags = parseArgs(argv, {
+    command: "--tui",
+    flags: {
+      tui: "boolean",
+      once: "boolean",
+      help: "boolean",
+      "base-url": "string",
+      host: "string",
+      bucket: "string",
+      start: "string",
+      end: "string",
+      timezone: "string",
+      now: "string",
+    },
+    rejectUnexpected: rejectConflict,
+  });
+  if (flags.help) {
     process.stdout.write(HELP);
     return;
   }
-  rejectConflicts(argv);
-  const once = argv.includes("--once");
-  const flags = parseArgs(
-    argv.filter((token) => token !== "--tui" && token !== "--once"),
-    {
-      command: "--tui",
-      flags: {
-        "base-url": "string",
-        host: "string",
-        bucket: "string",
-        start: "string",
-        end: "string",
-        timezone: "string",
-        now: "string",
-      },
-    },
-  );
-  const interactive = !once && Boolean(process.stdin.isTTY && process.stdout.isTTY);
+  const interactive = !flags.once && Boolean(process.stdin.isTTY && process.stdout.isTTY);
   if (!interactive) {
     await printOnce(flags);
     return;
@@ -70,11 +71,10 @@ async function dispatchTui(argv) {
   await live(flags);
 }
 
-function rejectConflicts(argv) {
-  const command = argv.find((token) => COMMANDS.includes(token));
-  const output = argv.find((token) => OUTPUT_FLAGS.has(token) || token.startsWith("--format=") || token.startsWith("--output="));
-  if (!command && !output) return;
-  const which = command ? `command \`${command}\`` : `output flag \`${output}\``;
+function rejectConflict(token) {
+  const command = COMMANDS.includes(token);
+  if (!command && !OUTPUT_FLAGS.has(token.split("=", 1)[0])) return;
+  const which = command ? `command \`${token}\`` : `output flag \`${token}\``;
   throw new AxiError(`\`--tui\` cannot be combined with ${which}.`, "VALIDATION_ERROR", [
     "Run `aw-axi --tui --base-url <url>` for the dashboard.",
     "Run the other command without `--tui` for its usual output.",
@@ -82,51 +82,60 @@ function rejectConflicts(argv) {
 }
 
 async function printOnce(flags) {
-  const columns = process.stdout.columns || 80;
   try {
     const model = await dashboardFrom(flags, "today");
-    writeFrame(model, columns);
+    writeFrame(model);
   } catch (error) {
-    writeFrame(errorModel(error), columns);
+    writeFrame(errorModel(error));
     process.exitCode = error instanceof AxiError ? exitCodeForError(error) : 1;
   }
 }
 
-function writeFrame(model, columns) {
-  const color = colorEnabled(process.stdout);
-  process.stdout.write(`${paintDashboard(renderDashboard(model, { columns }), color)}\n`);
+function writeFrame(model) {
+  const stdout = process.stdout;
+  const columns = stdout.columns || 80;
+  const text = renderDashboard(model, { columns });
+  stdout.write(`${paintDashboard(text, colorEnabled(stdout))}\n`);
 }
 
 async function live(flags) {
   const stdin = process.stdin;
   const stdout = process.stdout;
-  let mode = "today";
+  let mode = rangeModeAllowed(flags) ? "today" : "explicit";
   let scroll = 0;
-  let view = { ok: false, message: "Reading the current range." };
+  let view = null;
   let refreshing = false;
   let pending = false;
   let closed = false;
+  const controller = new AbortController();
+  const quit = Promise.withResolvers();
+  emitKeypressEvents(stdin);
   stdin.setRawMode(true);
   stdin.resume();
   stdout.write("\u001b[?1049h\u001b[?25l");
   const restore = () => {
     if (closed) return;
     closed = true;
+    controller.abort();
     stdout.write("\u001b[?25h\u001b[?1049l");
     if (stdin.isTTY) stdin.setRawMode(false);
     stdin.pause();
-    stdin.off("data", onData);
+    stdin.off("keypress", onKeypress);
     stdout.off("resize", paint);
     process.off("SIGTERM", onSignal);
     process.off("SIGINT", onSignal);
+    quit.resolve();
   };
   const paint = () => {
     if (closed) return;
     const columns = stdout.columns || 80;
-    const rows = stdout.rows || 24;
-    const framed = frameDashboard(renderDashboard(view, { columns }), { rows, scroll });
-    scroll = framed.offset;
-    stdout.write(`\u001b[H\u001b[2J${paintDashboard(framed.text, colorEnabled(stdout))}`);
+    let text = renderDashboard(view ?? { loading: true, mode }, { columns });
+    if (view) {
+      const framed = frameDashboard(text, { columns, rows: stdout.rows || 24, scroll });
+      scroll = framed.offset;
+      text = framed.text;
+    }
+    stdout.write(`\u001b[H\u001b[2J${paintDashboard(text, colorEnabled(stdout))}`);
   };
   const refresh = () => {
     if (closed) return;
@@ -135,7 +144,7 @@ async function live(flags) {
       return;
     }
     refreshing = true;
-    dashboardFrom(flags, mode).then(
+    dashboardFrom(flags, mode, controller.signal).then(
       (model) => {
         if (pending || closed) return;
         view = model;
@@ -155,45 +164,39 @@ async function live(flags) {
       }
     });
   };
-  const onData = (chunk) => {
-    const text = chunk.toString("utf8");
-    if (text.includes("\u0003") || text.includes("q")) {
+  const onKeypress = (text, key) => {
+    if (closed) return;
+    if (text === "\u0003" || text === "q") {
       restore();
       return;
     }
-    if (text.includes("r")) {
+    if (text === "r") {
       refresh();
       return;
     }
-    if (text.includes("j") || text.includes("\u001b[B")) scroll += 1;
-    if (text.includes("k") || text.includes("\u001b[A")) scroll = Math.max(0, scroll - 1);
-    if (rangeModeAllowed(flags) && text.includes("t")) {
-      mode = "today";
+    if (rangeModeAllowed(flags) && (text === "t" || text === "7")) {
+      const nextMode = text === "t" ? "today" : "seven";
       scroll = 0;
+      if (nextMode !== mode) {
+        mode = nextMode;
+        view = null;
+        paint();
+      }
       refresh();
       return;
     }
-    if (rangeModeAllowed(flags) && text.includes("7")) {
-      mode = "seven";
-      scroll = 0;
-      refresh();
-      return;
-    }
-    paint();
+    if (text === "j" || key.name === "down") scroll += 1;
+    else if (text === "k" || key.name === "up") scroll = Math.max(0, scroll - 1);
+    else return;
+    if (view) paint();
   };
   const onSignal = () => restore();
-  stdin.on("data", onData);
+  stdin.on("keypress", onKeypress);
   stdout.on("resize", paint);
   process.on("SIGTERM", onSignal);
   process.on("SIGINT", onSignal);
   refresh();
-  await new Promise((resolve) => {
-    const timer = setInterval(() => {
-      if (!closed) return;
-      clearInterval(timer);
-      resolve();
-    }, 30);
-  });
+  await quit.promise;
 }
 
 function startupError(error) {

@@ -94,7 +94,7 @@ function route(req, res, state, url, body) {
       res.destroy();
       return;
     }
-    return send(res, 200, saved);
+    return send(res, 200, state.faults.eventReply ?? saved);
   }
   if (req.method === "POST" && path === "/api/0/query/") {
     const query = body?.query?.[0] ?? "";
@@ -126,6 +126,11 @@ function route(req, res, state, url, body) {
     const key = decodeURIComponent(setting[1]);
     state.settingsPosts += 1;
     state.settings[key] = body;
+    if (state.faults.dropSettingWrite === key) {
+      delete state.faults.dropSettingWrite;
+      res.destroy();
+      return;
+    }
     if (state.faults.replaceAfterWrite?.key === key) {
       state.settings[key] = state.faults.replaceAfterWrite.replace;
       state.faults.replaceAfterWrite = null;

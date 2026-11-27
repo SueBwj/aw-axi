@@ -803,7 +803,7 @@ await check("legacy server writes refuse unverified native schemas", async () =>
     assert.match(shown.stdout, /browser_extension: not-readable/);
     const revision = shown.stdout.match(/revision: ([a-f0-9]{64})/)[1];
     const backup = path.join(dir, "backup.json");
-    const added = await run([
+    const add = [
       "rules",
       "add",
       "--server",
@@ -817,6 +817,16 @@ await check("legacy server writes refuse unverified native schemas", async () =>
       revision,
       "--backup",
       backup,
+    ];
+    const requestCount = server.state.requests.length;
+    const refusedAdd = await run(add);
+    assert.equal(refusedAdd.code, 1, refusedAdd.stdout);
+    assert.match(refusedAdd.stdout, /rules export --native, then rules apply/);
+    const refusedRevert = await run(["rules", "revert", "--server", "--backup", backup, "--expect", revision]);
+    assert.equal(refusedRevert.code, 1, refusedRevert.stdout);
+    assert.match(refusedRevert.stdout, /rules revert --native/);
+    const added = await run([
+      ...add,
       "--base-url",
       server.baseUrl,
       "--state",
@@ -824,6 +834,7 @@ await check("legacy server writes refuse unverified native schemas", async () =>
     ]);
     assert.equal(added.code, 1, added.stdout);
     assert.match(added.stdout, /complete native document/);
+    assert.equal(server.state.requests.length, requestCount);
     assert.equal(server.state.settingsPosts, 0);
     const sets = server.state.settings.category_sets;
     assert.equal(sets[0].categories[0].rule.regex, "^Notes$");

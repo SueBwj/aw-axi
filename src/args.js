@@ -1,5 +1,7 @@
 import { AxiError } from "axi-sdk-js";
 
+const NONEMPTY_FLAGS = new Set(["base-url", "state", "now", "bucket", "host", "id", "file", "rules"]);
+
 export function parseArgs(argv, definition) {
   const flags = {};
   const positionals = [];
@@ -11,6 +13,7 @@ export function parseArgs(argv, definition) {
       positionals.push(...argv.slice(index + 1));
       break;
     }
+    if (known.has("help") && (token === "--help" || token === "-h")) return { help: true };
     if (!token.startsWith("--")) {
       positionals.push(token);
       continue;
@@ -19,6 +22,7 @@ export function parseArgs(argv, definition) {
     const name = eq === -1 ? token.slice(2) : token.slice(2, eq);
     let inline = eq === -1 ? undefined : token.slice(eq + 1);
     if (!known.has(name)) {
+      definition.rejectUnexpected?.(token);
       throw new AxiError(
         `Unknown flag --${name} for \`${definition.command}\``,
         "VALIDATION_ERROR",
@@ -51,9 +55,13 @@ export function parseArgs(argv, definition) {
       inline = next;
       index += 1;
     }
+    if (inline === "" && NONEMPTY_FLAGS.has(name)) {
+      throw new AxiError("--" + name + " requires a nonempty value", "VALIDATION_ERROR");
+    }
     flags[name] = inline;
   }
   if (positionals.length > 0) {
+    if (definition.rejectUnexpected) positionals.forEach(definition.rejectUnexpected);
     throw new AxiError(
       `Unexpected argument \`${positionals[0]}\` for \`${definition.command}\``,
       "VALIDATION_ERROR",

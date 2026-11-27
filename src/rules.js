@@ -1,11 +1,18 @@
-import { readFile, writeFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { constants } from "node:fs";
+import { access, chmod, chown, mkdtemp, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { promisify } from "node:util";
 import { AxiError } from "axi-sdk-js";
 import { getSetting } from "./client.js";
-import { validateCategorySets } from "./native-rules.js";
-import { revisionOf, stableStringify } from "./revision.js";
+import { decimalParts, parseReplayJson } from "./json-numbers.js";
+import { withLock } from "./lock.js";
+import { effectiveCategories, validateCategory, validateCategorySets } from "./native-rules.js";
+import { absolutePath } from "./options.js";
+import { revisionOf, revisionOfBytes, stableStringify } from "./revision.js";
 
 const FORMAT = "activitywatch-axi.rules.v1";
+const execFileAsync = promisify(execFile);
 
 export async function rulesShow(flags, client) {
   const document = await readServerRules(client);
@@ -50,13 +57,14 @@ export async function rulesExport(flags, client) {
     active_set_ids: document.active_set_ids,
     classes: document.classes,
   };
-  await writeNewFile(file, `${JSON.stringify(payload, null, 2)}\n`);
+  const contents = `${JSON.stringify(payload, null, 2)}\n`;
+  await writeNewFile(file, contents);
   return {
     result: "exported",
     file,
     coverage: payload.coverage,
     browser_extension: "not-readable",
-    revision: revisionOf(document),
+    revision: revisionOfBytes(contents),
   };
 }
 
@@ -80,11 +88,15 @@ export async function rulesPreview(flags) {
       "VALIDATION_ERROR",
     );
   }
+  const coverage = parsed.value.coverage ?? "unknown";
+  const missingActiveIds = (coverage === "complete" || coverage === "server-sets") &&
+    validateCategorySets(parsed.value, { allowMissingActiveIds: true });
   return {
     file,
-    coverage: parsed.value.coverage ?? "unknown",
-    partial: parsed.value.coverage !== "complete",
-    revision: revisionOf(rulesPayload(parsed.value)),
+    coverage: missingActiveIds ? "incomplete" : coverage,
+    partial: missingActiveIds || coverage !== "complete",
+    ...(missingActiveIds ? { result: "Preview only. An active set is missing, so these rules cannot be used to categorize activity." } : {}),
+    revision: revisionOfBytes(parsed.bytes),
     browser_extension: parsed.value.browser_extension ?? null,
     unknown_fields: unknownFields(parsed.value, [
       "format",
@@ -98,7 +110,7 @@ export async function rulesPreview(flags) {
   };
 }
 
-export async function rulesAdd(flags, client) {
+export async function rulesAdd(flags) {
   const expect = requireExpect(flags.expect);
   const backup = requirePath(flags.backup, "--backup");
   const edit = parseEdit(flags);
@@ -110,7 +122,7 @@ export async function rulesAdd(flags, client) {
   throw new AxiError("Pass --file or --server", "VALIDATION_ERROR");
 }
 
-export async function rulesRevert(flags, client) {
+export async function rulesRevert(flags) {
   const expect = requireExpect(flags.expect);
   const backup = requirePath(flags.backup, "--backup");
   if (flags.file && flags.server) {
@@ -126,7 +138,7 @@ export async function loadCompleteRules(flags, client) {
     throw new AxiError("Pass either --rules or --server-rules", "VALIDATION_ERROR");
   }
   if (flags.rules) {
-    const parsed = await readRulesFile(requirePath(flags.rules, "--rules"));
+    const parsed = await readRulesFile(requirePath(flags.rules, "--rules"), parseRuleStructure);
     if (parsed.kind === "array") {
       throw new AxiError(
         "This rules file is only the first category set. Categorization was not run.",
@@ -141,24 +153,23 @@ export async function loadCompleteRules(flags, client) {
         ["Use a file whose coverage is complete, including every enabled set and its priority."],
       );
     }
-    const payload = rulesPayload(parsed.value);
-    return { source: "file", scope: "complete", categories: mergeActive(payload), document: payload };
+    return { scope: "complete", categories: effectiveCategories(parsed.value) };
   }
   if (flags["server-rules"]) {
-    const document = await readServerRules(client);
-    if (coverageOf(document) !== "complete") {
+    const [category_sets, active_set_ids] = await Promise.all([
+      getSetting(client, "category_sets", parseRuleStructure),
+      getSetting(client, "active_set_ids", JSON.parse),
+    ]);
+    try {
+      return { scope: "server-sets-only", categories: effectiveCategories({ category_sets, active_set_ids }) };
+    } catch (error) {
+      if (!(error instanceof AxiError) || error.code !== "VALIDATION_ERROR") throw error;
       throw new AxiError(
         "Server category settings are missing or incomplete. No default rules were used and categorization was not run.",
         "UNSUPPORTED",
         ["Browser-local rules were not searched. Pass --rules with an explicit complete file."],
       );
     }
-    return {
-      source: "server",
-      scope: "server-sets-only",
-      categories: mergeActive(document),
-      document,
-    };
   }
   throw new AxiError("Pass --rules <file> or --server-rules before categorizing", "VALIDATION_ERROR", [
     "Missing rules are reported as unsupported. They are not treated as an empty uncategorized total.",
@@ -166,42 +177,46 @@ export async function loadCompleteRules(flags, client) {
 }
 
 async function addFile(file, edit, expect, backup) {
-  const absolute = requirePath(file, "--file");
-  const original = await readFile(absolute);
-  const parsed = parseDocumentBytes(original, absolute);
-  assertExpect(rulesPayload(parsed), expect);
-  const next = applyAdd(parsed, edit);
-  if (stableStringify(rulesPayload(parsed)) === stableStringify(rulesPayload(next.document))) {
-    return { result: "no-op", file: absolute, revision: expect, masked: next.masked };
-  }
-  const again = await readFile(absolute);
-  if (!again.equals(original)) {
-    throw new AxiError("The rules file changed after it was read. No backup was written and the file was not edited.", "CONFLICT");
-  }
-  await writeNewFile(backup, original);
-  await writeFile(absolute, `${JSON.stringify(next.document, null, 2)}\n`, { mode: 0o600 });
-  return {
-    result: "updated",
-    file: absolute,
-    backup,
-    revision: revisionOf(rulesPayload(next.document)),
-    masked: next.masked,
-    server_transaction: "unsupported",
-  };
+  return editRulesFile(file, expect, async ({ absolute, target, original, parsed }) => {
+    const next = applyAdd(parsed, edit);
+    if (stableStringify(rulesPayload(parsed)) === stableStringify(rulesPayload(next.document))) {
+      return { result: "no-op", file: absolute, revision: expect, masked: next.masked };
+    }
+    const contents = `${JSON.stringify(next.document, null, 2)}\n`;
+    await replaceFile(absolute, target, original, contents, backup);
+    return {
+      result: "updated",
+      file: absolute,
+      backup,
+      revision: revisionOfBytes(contents),
+      masked: next.masked,
+      server_transaction: "unsupported",
+    };
+  });
 }
 
 async function revertFile(file, backup, expect) {
+  return editRulesFile(file, expect, async ({ absolute, target, original }) => {
+    const bytes = await readFile(backup);
+    parseDocumentBytes(bytes, parseRuleStructure);
+    if (original.equals(bytes)) return { result: "no-op", file: absolute, backup, revision: expect };
+    await replaceFile(absolute, target, original, bytes);
+    return { result: "restored", file: absolute, backup, revision: revisionOfBytes(bytes) };
+  }, parseRuleStructure);
+}
+
+async function editRulesFile(file, expect, edit, parse) {
   const absolute = requirePath(file, "--file");
-  const current = await readFile(absolute);
-  const parsed = parseDocumentBytes(current, absolute);
-  assertExpect(rulesPayload(parsed), expect);
-  const bytes = await readFile(backup);
-  const again = await readFile(absolute);
-  if (!again.equals(current)) {
-    throw new AxiError("The rules file changed after it was read. It was not reverted.", "CONFLICT");
-  }
-  await writeFile(absolute, bytes);
-  return { result: "restored", file: absolute, backup };
+  const target = await realpath(absolute);
+  return withLock(path.dirname(target), `.aw-axi-rules-${revisionOf(target)}`, async () => {
+    if (await realpath(absolute) !== target) {
+      throw new AxiError("The rules file destination changed before it was read. The file was not replaced.", "CONFLICT");
+    }
+    const original = await readFile(target);
+    const parsed = parseDocumentBytes(original, parse);
+    assertExpect(original, expect);
+    return edit({ absolute, target, original, parsed });
+  });
 }
 
 function applyAdd(document, edit) {
@@ -221,7 +236,12 @@ function applyAdd(document, edit) {
   } else {
     const rule = existing.rule;
     if (rule.type === "regex") {
-      if (rule.regex !== edit.pattern) rule.regex = `${rule.regex}|${edit.pattern}`;
+      if (rule.regex !== edit.pattern) {
+        if (hasBackreference(rule.regex) || hasBackreference(edit.pattern)) {
+          throw new AxiError("Cannot append a regex alternative with backreferences.", "VALIDATION_ERROR");
+        }
+        rule.regex = `${rule.regex}|${edit.pattern}`;
+      }
     } else {
       rule.type = "regex";
       rule.regex = edit.pattern;
@@ -231,7 +251,7 @@ function applyAdd(document, edit) {
   if (edit.ignoreCase) edited.rule.ignore_case = true;
   if (edit.selectKeys) edited.rule.select_keys = edit.selectKeys;
   const payload = rulesPayload(next);
-  const merged = mergeActive(payload);
+  const merged = effectiveCategories(payload);
   payload.classes = merged.map((category) => structuredClone(category));
   next.classes = payload.classes;
   const winner = merged.find((category) => JSON.stringify(category.name) === key);
@@ -239,22 +259,9 @@ function applyAdd(document, edit) {
   return { document: next, masked };
 }
 
-export function mergeActive(document) {
-  validateCategorySets(document);
-  const ordered = document.active_set_ids.map((id) => document.category_sets.find((set) => set.id === id));
-  const seen = new Set();
-  const hidden = new Set(ordered[0].tombstones ?? []);
-  const merged = [];
-  ordered.forEach((set, index) => {
-    for (const category of set.categories) {
-      const key = JSON.stringify(category.name);
-      if (seen.has(key)) continue;
-      if (index > 0 && hidden.has(key)) continue;
-      seen.add(key);
-      merged.push(category);
-    }
-  });
-  return merged;
+function hasBackreference(pattern) {
+  const tokens = /(\\[1-9k])|\\[\s\S]|\[(?:\\[\s\S]|[^\]\\])*\]/g;
+  return pattern.matchAll(tokens).some((match) => Boolean(match[1]));
 }
 
 function rulesPayload(document) {
@@ -326,9 +333,10 @@ function parseEdit(flags) {
   } catch {
     throw new AxiError("The pattern is not a valid regular expression. Nothing was written.", "VALIDATION_ERROR");
   }
-  const selectKeys = flags["select-keys"]
-    ? flags["select-keys"].split(",").map((part) => part.trim()).filter(Boolean)
-    : undefined;
+  const selectKeys = flags["select-keys"]?.split(",").map((part) => part.trim()).filter(Boolean);
+  if (selectKeys?.length === 0) {
+    throw new AxiError("--select-keys requires at least one field name", "VALIDATION_ERROR");
+  }
   return { setId: flags.set, name, pattern: flags.pattern, ignoreCase: Boolean(flags["ignore-case"]), selectKeys };
 }
 
@@ -341,7 +349,7 @@ async function readServerRules(client) {
   return { category_sets: categorySets, active_set_ids: activeIds, classes };
 }
 
-async function readRulesFile(file) {
+async function readRulesFile(file, parse) {
   let bytes;
   try {
     bytes = await readFile(file);
@@ -351,27 +359,16 @@ async function readRulesFile(file) {
     }
     throw error;
   }
-  let value;
-  try {
-    value = JSON.parse(bytes.toString("utf8"));
-  } catch {
-    throw new AxiError("The rules file is not JSON. It was not modified.", "VALIDATION_ERROR");
-  }
+  const value = parseRulesJson(bytes, parse);
   if (Array.isArray(value)) return { kind: "array", value };
   if (value && typeof value === "object" && value.format === FORMAT) {
-    if (value.coverage === "complete" || value.coverage === "server-sets") validateCategorySets(value);
-    return { kind: "document", value };
+    return { kind: "document", value, bytes };
   }
   return { kind: "other", value };
 }
 
-function parseDocumentBytes(bytes, file) {
-  let value;
-  try {
-    value = JSON.parse(bytes.toString("utf8"));
-  } catch {
-    throw new AxiError("The rules file is not JSON. It was not modified.", "VALIDATION_ERROR");
-  }
+function parseDocumentBytes(bytes, parse) {
+  const value = parseRulesJson(bytes, parse);
   if (!value || typeof value !== "object" || Array.isArray(value) || value.format !== FORMAT) {
     throw new AxiError(
       "Refusing to edit a file that is not an activitywatch-axi rules document.",
@@ -386,11 +383,34 @@ function parseDocumentBytes(bytes, file) {
     );
   }
   validateCategorySets(value);
+  if (value.classes != null) {
+    if (!Array.isArray(value.classes)) {
+      throw new AxiError("Legacy classes must be a list or null.", "VALIDATION_ERROR");
+    }
+    value.classes.forEach(validateCategory);
+  }
   return value;
 }
 
-function assertExpect(document, expect) {
-  const actual = revisionOf(document);
+function parseRulesJson(bytes, parse = text => parseReplayJson(text, "VALIDATION_ERROR")) {
+  try {
+    return parse(bytes.toString("utf8"));
+  } catch (error) {
+    if (!(error instanceof SyntaxError)) throw error;
+    throw new AxiError("The rules file is not JSON. It was not modified.", "VALIDATION_ERROR");
+  }
+}
+
+function parseRuleStructure(text) {
+  return JSON.parse(text, (key, value, context) => {
+    if ((key === "priority" || key === "weight") && Number.isInteger(value) &&
+        decimalParts(context.source).exponent < 0) return NaN;
+    return value;
+  });
+}
+
+function assertExpect(bytes, expect) {
+  const actual = revisionOfBytes(bytes);
   if (actual !== expect) {
     throw new AxiError(
       `The current revision is ${actual}, not ${expect}. Nothing was written.`,
@@ -409,7 +429,7 @@ function requireExpect(value) {
 
 function requirePath(value, flag) {
   if (!value) throw new AxiError(`${flag} is required`, "VALIDATION_ERROR");
-  return path.resolve(value);
+  return absolutePath(value);
 }
 
 async function writeNewFile(file, contents) {
@@ -420,5 +440,45 @@ async function writeNewFile(file, contents) {
       throw new AxiError(`${file} already exists. Choose a new path so the previous bytes stay intact.`, "CONFLICT");
     }
     throw error;
+  }
+}
+
+async function requirePlainPermissions(file) {
+  const darwin = process.platform === "darwin";
+  const args = darwin ? ["-ldbe@", file]
+    : process.platform === "linux" ? ["-ld", "--quoting-style=escape", "--", file] : null;
+  if (args) {
+    const listing = await execFileAsync("ls", args, { env: { ...process.env, LC_ALL: "C" } }).catch(() => null);
+    const plain = /^[-d][rwxstST-]{9}[ \t][^\r\n]*\n$/;
+    const provenanceOnly = /^[-d][rwxstST-]{9}@[ \t][^\r\n]*\n\tcom\.apple\.provenance\t[ \t]*\d+[ \t]*\n$/;
+    if (listing && (plain.test(listing.stdout) || (darwin && provenanceOnly.test(listing.stdout)))) return;
+  }
+  throw new AxiError("Cannot verify that the rules file or staging directory has plain permissions. The file was not replaced.", "UNSUPPORTED");
+}
+
+async function replaceFile(requested, file, original, contents, backup) {
+  await access(file, constants.W_OK);
+  const { uid, gid, mode, dev, ino, ctimeMs } = await stat(file);
+  await requirePlainPermissions(file);
+  if (backup) await writeNewFile(backup, original);
+  const staging = await mkdtemp(path.join(path.dirname(file), ".aw-axi-"));
+  const replacement = path.join(staging, "rules.json");
+  try {
+    await requirePlainPermissions(staging);
+    await writeFile(replacement, contents, { mode: 0o600, flush: true });
+    const staged = await stat(replacement);
+    if (staged.uid !== uid || staged.gid !== gid) await chown(replacement, uid, gid);
+    await chmod(replacement, mode & 0o777);
+    await requirePlainPermissions(replacement);
+    const current = await readFile(file);
+    const metadata = await stat(file);
+    if (!current.equals(original) || metadata.dev !== dev || metadata.ino !== ino || metadata.ctimeMs !== ctimeMs ||
+        metadata.uid !== uid || metadata.gid !== gid || metadata.mode !== mode ||
+        await realpath(requested) !== file) {
+      throw new AxiError("The rules file or its destination changed after it was read. The file was not replaced.", "CONFLICT");
+    }
+    await rename(replacement, file);
+  } finally {
+    await rm(staging, { recursive: true, force: true });
   }
 }

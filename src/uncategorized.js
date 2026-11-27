@@ -2,12 +2,14 @@ import { AxiError } from "axi-sdk-js";
 import { getBuckets, queryBucket, selectActivityBuckets } from "./client.js";
 import { nowFrom } from "./options.js";
 import { loadCompleteRules } from "./rules.js";
-import { formatInstant, intersect, rangeFrom, secondsFromMs, timeZoneFrom } from "./time.js";
+import { formatInstant, intersect, rangeFrom, secondsFromMs, sweepIntervals, timeZoneFrom } from "./time.js";
+
+const NOT_AFK = Symbol("not-afk");
 
 export async function uncategorized(flags, client) {
+  const now = nowFrom(flags);
   const loaded = await loadCompleteRules(flags, client);
   compileRules(loaded.categories);
-  const now = nowFrom(flags);
   const timeZone = timeZoneFrom(flags);
   const range = rangeFrom(flags, now, timeZone);
   const buckets = await getBuckets(client);
@@ -35,10 +37,11 @@ export async function uncategorized(flags, client) {
   const notAfk = afks.length === 0 ? null : await notAfkIntervals(client, afks[0], range);
   const windowPieces = await piecesFrom(client, windows[0], range, notAfk);
   const webPieces = await piecesFrom(client, webs[0], range, notAfk);
-  const appPieces = windowPieces.map((piece) => ({ ...piece, key: appName(piece.event), categorized: categorized(piece.event, loaded.categories) }));
-  const domainPieces = webPieces.map((piece) => ({ ...piece, key: domainName(piece.event), categorized: categorized(piece.event, loaded.categories) }));
-  const apps = rows(allocate(appPieces), "name");
-  const domains = rows(allocate(domainPieces), "domain");
+  const appPieces = windowPieces.map((piece) => ({ ...piece, key: categorized(piece.event, loaded.categories) ? null : appName(piece.event) }));
+  const domainPieces = webPieces.map((piece) => ({ ...piece, key: categorized(piece.event, loaded.categories) ? null : domainName(piece.event) }));
+  const allowed = notAfk?.map((interval) => ({ ...interval, key: NOT_AFK }));
+  const apps = rows(allocate(appPieces, range, allowed), "name");
+  const domains = rows(allocate(domainPieces, range, allowed), "domain");
   return {
     ...header,
     afk_filter: notAfk ? "applied" : "unavailable",
@@ -53,7 +56,10 @@ export async function uncategorized(flags, client) {
 async function piecesFrom(client, bucket, range, notAfk) {
   if (!bucket) return [];
   const events = await queryBucket(client, bucket.id, range.start, range.end);
-  return events.flatMap((event) => clipEvent(event, range, notAfk));
+  return events.flatMap((event) => {
+    const piece = clipEvent(event, range);
+    return piece && (!notAfk || touchesNotAfk(piece, notAfk)) ? [{ ...piece, event }] : [];
+  });
 }
 
 async function notAfkIntervals(client, bucket, range) {
@@ -67,7 +73,7 @@ async function notAfkIntervals(client, bucket, range) {
         "INCOMPLETE",
       );
     }
-    const piece = clipEvent(event, range, null)[0];
+    const piece = clipEvent(event, range);
     if (!piece) continue;
     intervals.push({ ...piece, status });
   }
@@ -91,42 +97,38 @@ async function notAfkIntervals(client, bucket, range) {
   return intervals.filter((interval) => interval.status === "not-afk");
 }
 
-function clipEvent(event, range, notAfk) {
+function clipEvent(event, range) {
   const start = Date.parse(event?.timestamp);
   const durationMs = Number(event?.duration) * 1000;
-  if (!Number.isFinite(start) || !Number.isFinite(durationMs) || durationMs <= 0) return [];
-  const bounded = intersect(start, start + durationMs, range.start.epochMilliseconds, range.end.epochMilliseconds);
-  if (!bounded) return [];
-  const base = { ...bounded, event };
-  if (!notAfk) return [base];
-  return notAfk
-    .map((interval) => {
-      const clipped = intersect(base.start, base.end, interval.start, interval.end);
-      return clipped ? { ...clipped, event } : null;
-    })
-    .filter(Boolean);
+  if (!Number.isFinite(start) || !Number.isFinite(durationMs) || durationMs <= 0) return null;
+  return intersect(start, start + durationMs, range.start.epochMilliseconds, range.end.epochMilliseconds);
 }
 
-function allocate(pieces) {
-  const points = new Set();
-  for (const piece of pieces) {
-    points.add(piece.start);
-    points.add(piece.end);
+function touchesNotAfk(piece, notAfk) {
+  let first = 0;
+  let last = notAfk.length;
+  while (first < last) {
+    const mid = Math.floor((first + last) / 2);
+    if (notAfk[mid].end <= piece.start) first = mid + 1;
+    else last = mid;
   }
-  const sorted = [...points].sort((a, b) => a - b);
+  return first < notAfk.length && notAfk[first].start < piece.end;
+}
+
+function allocate(pieces, range, allowed) {
+  if (pieces.length === 0) return new Map();
+  const intervals = allowed ? [...pieces, ...allowed] : pieces;
   const totals = new Map();
-  for (let index = 0; index < sorted.length - 1; index += 1) {
-    const start = sorted[index];
-    const end = sorted[index + 1];
-    const active = pieces.filter((piece) => piece.start <= start && piece.end >= end);
-    if (active.length === 0) continue;
-    if (active.some((piece) => piece.key !== active[0].key || piece.categorized !== active[0].categorized)) {
+  sweepIntervals(intervals, range.start.epochMilliseconds, range.end.epochMilliseconds, (span, active) => {
+    const notAfk = active.has(NOT_AFK);
+    if (allowed && !notAfk) return;
+    if (active.size - Number(notAfk) > 1) {
       throw new AxiError("Overlapping activity has ambiguous attribution. No app or domain totals were returned.", "INCOMPLETE");
     }
-    if (active[0].categorized) continue;
-    const key = active[0].key;
-    totals.set(key, (totals.get(key) ?? 0) + (end - start));
-  }
+    for (const key of active.keys()) {
+      if (typeof key === "string") totals.set(key, (totals.get(key) ?? 0) + span);
+    }
+  });
   return totals;
 }
 
@@ -148,29 +150,15 @@ function compileRules(categories) {
 }
 
 function categorized(event, categories) {
-  let best = null;
-  let bestRank = null;
   for (const category of categories) {
     const regex = category.compiled;
     if (!regex) continue;
     const keys = Array.isArray(category.rule.select_keys) && category.rule.select_keys.length > 0
       ? category.rule.select_keys
       : ["app", "title", "url"];
-    const matched = keys.some((key) => typeof event?.data?.[key] === "string" && regex.test(event.data[key]));
-    if (!matched) continue;
-    const rank = categoryRank(category);
-    if (best === null || rank > bestRank) {
-      best = category;
-      bestRank = rank;
-    }
+    if (keys.some((key) => typeof event?.data?.[key] === "string" && regex.test(event.data[key]))) return true;
   }
-  return best !== null;
-}
-
-function categoryRank(category) {
-  const explicit = category.rule?.priority ?? category.rule?.weight;
-  if (typeof explicit === "number" && Number.isInteger(explicit)) return explicit;
-  return Array.isArray(category.name) ? category.name.length * 10 : 0;
+  return false;
 }
 
 function appName(event) {
