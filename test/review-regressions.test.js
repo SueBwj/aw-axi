@@ -318,7 +318,8 @@ test("legacy export, preview, and successful edits report the exact file revisio
   state.settings = { category_sets, active_set_ids, classes };
   const base = ["--base-url", server.baseUrl];
   const shown = await run(["rules", "show", ...base]);
-  assert.match(shown.stdout, new RegExp(`^revision: ${revisionOf(state.settings)}$`, "m"));
+  const settingsRevision = createHash("sha256").update('{"active_set_ids":["default"],"category_sets":[{"categories":[{"name":["Work"],"rule":{"regex":"^Notes$","type":"regex"}}],"id":"default"}],"classes":[]}').digest("hex");
+  assert.match(shown.stdout, new RegExp(`^revision: ${settingsRevision}$`, "m"));
   const exported = path.join(dir, "export.json");
   const exportedResult = await run(["rules", "export", "--file", exported, ...base]);
   const before = await readFile(exported);
@@ -1390,7 +1391,9 @@ test("native Rust keeps unrelated settings in revisions without requiring replay
   const before = nativeTaxonomy();
   const after = nativeTaxonomy({}, { values: [42] });
   state.settings = { ...before, unrelated: 1e24 };
-  const expect = revisionOf(state.settings);
+  const canonicalBefore = '{"active_set_ids":["default"],"category_sets":[{"categories":[{"name":["Work"],"rule":{"type":"none"}}],"id":"default"},{"categories":[],"id":"inactive"}],"classes":[{"name":["Work"],"rule":{"type":"none"}}],"unrelated":1e+24}';
+  const canonicalAfter = '{"active_set_ids":["default"],"category_sets":[{"categories":[{"name":["Work"],"rule":{"type":"none"}}],"id":"default"},{"categories":[],"id":"inactive","values":[42]}],"classes":[{"name":["Work"],"rule":{"type":"none"}}],"unrelated":1e+24}';
+  const expect = createHash("sha256").update(canonicalBefore).digest("hex");
   const show = () => native("show", ["--native"]);
   const shown = await show();
   assert.equal(shown.code, 0, shown.stdout);
@@ -1402,11 +1405,11 @@ test("native Rust keeps unrelated settings in revisions without requiring replay
   assert.equal(applied.code, 0, applied.stdout);
   assert.deepEqual(state.settings, { ...after, unrelated: 1e24 });
   assert.deepEqual(JSON.parse(await readFile(outgoing, "utf8")).settings, before);
-  const appliedRevision = revisionOf(state.settings);
+  const appliedRevision = createHash("sha256").update(canonicalAfter).digest("hex");
   assert.match(applied.stdout, new RegExp(`^revision: ${appliedRevision}$`, "m"));
 
   state.settings.unrelated = 2e24;
-  const changedRevision = revisionOf(state.settings);
+  const changedRevision = createHash("sha256").update(canonicalAfter.replace('"unrelated":1e+24', '"unrelated":2e+24')).digest("hex");
   assert.notEqual(changedRevision, appliedRevision);
   const changed = await show();
   assert.equal(changed.code, 0, changed.stdout);
