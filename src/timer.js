@@ -1,5 +1,5 @@
 import { AxiError } from "axi-sdk-js";
-import { getEvents, postEvents, resolveStopwatchBucket } from "./client.js";
+import { acknowledgedTimestamp, assertStopwatchReplay, getEvents, postEvents, resolveStopwatchBucket } from "./client.js";
 import { withLock } from "./lock.js";
 import { nowFrom, requireEventId, requireLabel, stateDirFrom } from "./options.js";
 import { secondsFromMs } from "./time.js";
@@ -68,7 +68,7 @@ export async function timerStart(flags, client) {
       id: saved[0].id,
       label,
       running: true,
-      started: saved[0].timestamp,
+      started: acknowledgedTimestamp(saved[0], now),
     };
   });
 }
@@ -86,7 +86,7 @@ export async function timerStop(flags, client) {
     if (!bucketId) {
       return { result: "no-op", bucket: null, label: label ?? null, id: id ?? null, running: false };
     }
-    const events = await getEvents(client, bucketId);
+    const events = await getEvents(client, bucketId, { replay: true });
     const target = selectStopTarget(events, { label, id });
     if (target.kind === "absent") {
       return {
@@ -108,6 +108,7 @@ export async function timerStop(flags, client) {
         running: false,
       };
     }
+    assertStopwatchReplay(event);
     const started = Date.parse(event.timestamp);
     const elapsed = now.getTime() - started;
     if (!Number.isFinite(started) || elapsed < 0) {
@@ -148,7 +149,7 @@ export async function timerSwitch(flags, client) {
   const stateDir = stateDirFrom(flags);
   return withLock(stateDir, "timer", async () => {
     const bucketId = await resolveStopwatchBucket(client, flags.bucket, { create: true });
-    const events = await getEvents(client, bucketId);
+    const events = await getEvents(client, bucketId, { replay: true });
     const running = events.filter((event) => event?.data?.running === true);
     let source = null;
     if (from !== undefined) {
@@ -190,6 +191,7 @@ export async function timerSwitch(flags, client) {
     }
     let stoppedId = null;
     if (source) {
+      assertStopwatchReplay(source);
       const started = Date.parse(source.timestamp);
       const elapsed = now.getTime() - started;
       if (!Number.isFinite(started) || elapsed < 0) {
@@ -235,6 +237,7 @@ export async function timerSwitch(flags, client) {
           data: { label: to, running: true },
         },
       ]);
+      acknowledgedTimestamp(saved[0], now);
       return {
         result: "switched",
         bucket: bucketId,

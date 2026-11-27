@@ -1,19 +1,28 @@
 import { AxiError } from "axi-sdk-js";
+import { Temporal } from "temporal-polyfill";
+import { numberReplaysExactly, parseReplayJson } from "./json-numbers.js";
 
 const READ_LIMIT = 10000;
+const inexactStopwatchReplays = new WeakSet();
+export const MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 
-export function createClient(baseUrl) {
+export function createClient(baseUrl, signal, { closeConnection = false } = {}) {
   return {
     baseUrl,
-    async request(method, path, { body, mutation = false, expectBody = false, raw = false } = {}) {
+    async request(method, path, { body, mutation = false, expectBody = false, raw = false, parse = JSON.parse } = {}) {
       const url = `${baseUrl}${path}`;
       let response;
       try {
+        signal?.throwIfAborted();
+        const timeout = AbortSignal.timeout(8000);
         response = await fetch(url, {
           method,
           redirect: "error",
-          signal: AbortSignal.timeout(8000),
-          headers: body === undefined ? undefined : { "content-type": "application/json" },
+          signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+          headers: body === undefined && !closeConnection ? undefined : {
+            ...(body === undefined ? {} : { "content-type": "application/json" }),
+            ...(closeConnection ? { connection: "close" } : {}),
+          },
           body: body === undefined ? undefined : JSON.stringify(body),
         });
       } catch (error) {
@@ -29,7 +38,7 @@ export function createClient(baseUrl) {
             const { done, value } = await reader.read();
             if (done) break;
             size += value.length;
-            if (size > 8 * 1024 * 1024) {
+            if (size > MAX_RESPONSE_BYTES) {
               await reader.cancel();
               throw new Error("Response exceeds the 8 MiB read limit");
             }
@@ -66,8 +75,9 @@ export function createClient(baseUrl) {
         return undefined;
       }
       try {
-        return JSON.parse(text);
-      } catch {
+        return parse(text);
+      } catch (error) {
+        if (error instanceof AxiError) throw error;
         if (mutation) {
           throw new AxiError(
             "ActivityWatch returned a write response that was not JSON. This command did not send it again.",
@@ -162,10 +172,11 @@ export async function getBuckets(client) {
   return value;
 }
 
-export async function getEvents(client, bucketId) {
+export async function getEvents(client, bucketId, { replay = false } = {}) {
   const value = await client.request(
     "GET",
     `/api/0/buckets/${encodeURIComponent(bucketId)}/events?limit=${READ_LIMIT}`,
+    { parse: text => parseStopwatchEvents(text, false, replay) },
   );
   if (!Array.isArray(value)) {
     throw new AxiError(`Events for ${bucketId} were not a list`, "SERVER");
@@ -184,16 +195,59 @@ export async function postEvents(client, bucketId, events) {
   const value = await client.request(
     "POST",
     `/api/0/buckets/${encodeURIComponent(bucketId)}/events`,
-    { body: events, mutation: true, expectBody: true },
+    { body: events, mutation: true, expectBody: true, parse: text => parseStopwatchEvents(text, true) },
   );
-  if (!Array.isArray(value) || value.length === 0 || value[0]?.id === undefined) {
-    throw new AxiError(
-      "ActivityWatch did not return an event id. This command did not send another event.",
-      "UNCERTAIN_WRITE",
-      ["Run `aw-axi timer status --base-url <url>` and continue from the id it shows."],
-    );
+  if (!Array.isArray(value) || value.length !== events.length) {
+    throw uncertainEventAcknowledgment();
   }
   return value;
+}
+
+function parseStopwatchEvents(text, mutation, replay = false) {
+  const rounded = new WeakSet();
+  const inexactNumbers = replay ? new WeakSet() : null;
+  const parsed = JSON.parse(text, function (key, value, context) {
+    if (key === "id" && typeof value === "number" && context.source !== String(value)) rounded.add(this);
+    if (inexactNumbers && (inexactNumbers.has(value) ||
+        (typeof value === "number" && !numberReplaysExactly(value, context.source)))) {
+      inexactNumbers.add(this);
+      if (key === "timestamp" || key === "data") inexactStopwatchReplays.add(this);
+    }
+    return value;
+  });
+  if (Array.isArray(parsed) && parsed.some(event =>
+    !Number.isSafeInteger(event?.id) || rounded.has(event))) {
+    if (mutation) throw uncertainEventAcknowledgment();
+    throw new AxiError("ActivityWatch returned an invalid or inexact stopwatch event id.", "SERVER");
+  }
+  return parsed;
+}
+
+export function assertStopwatchReplay(event) {
+  if (inexactStopwatchReplays.has(event)) {
+    throw new AxiError("A stopwatch JSON number cannot be replayed without rounding.", "SERVER");
+  }
+}
+
+export function acknowledgedTimestamp(event, requested) {
+  const { timestamp } = event;
+  const requestedMs = requested.getTime();
+  if (typeof timestamp === "string" && Date.parse(timestamp) === requestedMs) {
+    try {
+      if (Temporal.Instant.from(timestamp).equals(Temporal.Instant.fromEpochMilliseconds(requestedMs))) return timestamp;
+    } catch {
+      throw uncertainEventAcknowledgment("event timestamp");
+    }
+  }
+  throw uncertainEventAcknowledgment("event timestamp");
+}
+
+function uncertainEventAcknowledgment(field = "event id") {
+  return new AxiError(
+    `ActivityWatch did not return a verifiable ${field}. This command did not send another event.`,
+    "UNCERTAIN_WRITE",
+    ["Run `aw-axi timer status --base-url <url>` and compare ids before continuing."],
+  );
 }
 
 export async function resolveStopwatchBucket(client, explicitId, { create = false } = {}) {
@@ -202,7 +256,9 @@ export async function resolveStopwatchBucket(client, explicitId, { create = fals
   if (explicitId) {
     const existing = buckets[explicitId];
     if (!existing) {
-      if (!create) return null;
+      if (!create) {
+        throw new AxiError(`Stopwatch bucket ${JSON.stringify(explicitId)} was not found.`, "NOT_FOUND");
+      }
       if (matches.length > 0) {
         throw new AxiError(
           `Bucket ${explicitId} does not exist, and another stopwatch bucket is already present.`,
@@ -257,8 +313,8 @@ export async function queryBucket(client, bucketId, start, end) {
   return value[0];
 }
 
-export async function getSetting(client, key) {
-  const value = await client.request("GET", `/api/0/settings/${encodeURIComponent(key)}`);
+export async function getSetting(client, key, parse = text => parseReplayJson(text, "SERVER")) {
+  const value = await client.request("GET", `/api/0/settings/${encodeURIComponent(key)}`, { parse });
   return value === undefined ? null : value;
 }
 

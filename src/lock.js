@@ -1,10 +1,10 @@
-import { open, mkdir, readFile, rm } from "node:fs/promises";
+import { open, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import path from "node:path";
 import { AxiError } from "axi-sdk-js";
 
 export async function withLock(stateDir, name, fn) {
   await mkdir(stateDir, { recursive: true, mode: 0o700 });
-  const lockPath = path.join(stateDir, `${name}.lock`);
+  const lockPath = path.join(await realpath(stateDir), `${name}.lock`);
   const token = `${process.pid}:${Date.now()}:${Math.random()}`;
   const deadline = Date.now() + 5000;
   let handle;

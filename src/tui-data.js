@@ -1,16 +1,16 @@
 import { AxiError } from "axi-sdk-js";
 import { getBuckets, getEvents, getSetting, queryBucket, selectActivityBuckets } from "./client.js";
+import { NATIVE_KEYS, validateSettings } from "./native-rules.js";
 import { clientFrom, nowFrom } from "./options.js";
-import { instantFromDate, intersect, rangeFrom, timeZoneFrom, unionMs } from "./time.js";
+import { instantFromDate, intersect, rangeFrom, sweepIntervals, timeZoneFrom, unionMs } from "./time.js";
 
 const READ_LIMIT = 10000;
-const NATIVE_KEYS = ["category_sets", "active_set_ids", "classes"];
 
 export function sanitizeTerminal(value) {
   return String(value ?? "")
-    .replace(/\u001B\][\s\S]*?(?:\u0007|\u001B\\)/g, "")
-    .replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "")
-    .replace(/[\u0000-\u001F\u007F]/g, "");
+    .replace(/(?:\u001B\]|\u009D)[\s\S]*?(?:\u0007|\u001B\\|\u009C|$)/g, "")
+    .replace(/(?:\u001B\[|\u009B)[0-?]*[ -/]*[@-~]/g, "")
+    .replace(/[\u0000-\u001F\u007F-\u009F]/g, "");
 }
 
 export function displayWidth(text) {
@@ -22,7 +22,7 @@ export function displayWidth(text) {
 
 function graphemeWidth(segment) {
   if (!segment) return 0;
-  if (/\p{Extended_Pictographic}/u.test(segment)) return 2;
+  if (/\p{Extended_Pictographic}|^\p{Regional_Indicator}{2}$|^[#*0-9]\uFE0F?\u20E3$/u.test(segment)) return 2;
   for (const char of segment) {
     const code = char.codePointAt(0);
     if (isWide(code)) return 2;
@@ -121,23 +121,20 @@ export function partitionAfk(startMs, endMs, events) {
     const piece = intersect(start, start + durationMs, startMs, endMs);
     if (!piece) continue;
     const status = event?.data?.status;
-    const kind = status === "afk" || status === "not-afk" ? status : "unrecognized";
-    clipped.push({ ...piece, kind });
+    const key = status === "afk" || status === "not-afk" ? status : "unrecognized";
+    clipped.push({ ...piece, key });
   }
-  const points = new Set([startMs, endMs]);
-  for (const interval of clipped) {
-    points.add(interval.start);
-    points.add(interval.end);
-  }
-  for (const [lo, hi] of spans([...points].sort((a, b) => a - b), startMs, endMs)) {
-    const covering = clipped.filter((interval) => interval.start <= lo && interval.end >= hi);
-    const span = hi - lo;
-    if (covering.length === 0) totals.missing += span;
-    else if (covering.length > 1) totals.overlap += span;
-    else if (covering[0].kind === "unrecognized") totals.unrecognized += span;
-    else if (covering[0].kind === "afk") totals.afk += span;
+  sweepIntervals(clipped, startMs, endMs, (span, active) => {
+    if (active.size === 0) {
+      totals.missing += span;
+      return;
+    }
+    const [status, count] = active.entries().next().value;
+    if (active.size > 1 || count > 1) totals.overlap += span;
+    else if (status === "unrecognized") totals.unrecognized += span;
+    else if (status === "afk") totals.afk += span;
     else totals.notAfk += span;
-  }
+  });
   const complete = totals.missing === 0 && totals.overlap === 0 && totals.unrecognized === 0 && totals.invalid === 0;
   return { ...totals, complete };
 }
@@ -170,7 +167,11 @@ export function activityUnions(startMs, endMs, events, keyOf) {
   }
   const rows = [...grouped.entries()]
     .map(([key, pieces]) => ({ key, ms: unionMs(pieces).union }))
-    .sort((a, b) => b.ms - a.ms || (a.key < b.key ? -1 : a.key > b.key ? 1 : 0));
+    .sort((a, b) => {
+      const left = a.key ?? "";
+      const right = b.key ?? "";
+      return b.ms - a.ms || (left < right ? -1 : left > right ? 1 : 0);
+    });
   const rowSum = rows.reduce((sum, row) => sum + row.ms, 0);
   return {
     union: truncated ? null : union.union,
@@ -183,22 +184,12 @@ export function activityUnions(startMs, endMs, events, keyOf) {
 }
 
 export function windowKey(event) {
-  const app = sanitizeTerminal(event?.data?.app);
-  return app.trim() ? app : "(unnamed)";
+  const app = event?.data?.app;
+  return typeof app === "string" && app.length > 0 ? app : null;
 }
 
 export function webKey(event) {
-  return reduceDomain(event?.data?.url);
-}
-
-function spans(points, startMs, endMs) {
-  const pairs = [];
-  for (let index = 0; index < points.length - 1; index += 1) {
-    const lo = points[index];
-    const hi = points[index + 1];
-    if (hi > lo && lo >= startMs && hi <= endMs) pairs.push([lo, hi]);
-  }
-  return pairs;
+  return reduceDomain(event?.data?.url) ?? "Unattributed";
 }
 
 export async function loadDashboard(flags, client, mode = "today") {
@@ -216,26 +207,9 @@ export async function loadDashboard(flags, client, mode = "today") {
   const apps = windowEvents
     ? activityUnions(startMs, endMs, windowEvents, windowKey)
     : { union: null, overlap: null, rows: [], invalid: 0, truncated: false, rowsOverlap: false, absent: true };
-  const domains = [];
-  let webInvalid = 0;
-  let webTruncated = false;
-  if (webEvents) {
-    if (webEvents.length >= READ_LIMIT) webTruncated = true;
-    else {
-      for (const event of webEvents) {
-        if (!webKey(event)) webInvalid += 1;
-      }
-    }
-  }
   const web = webEvents
-    ? activityUnions(startMs, endMs, webTruncated ? [] : webEvents.filter((event) => webKey(event)), (event) => webKey(event))
+    ? activityUnions(startMs, endMs, webEvents, webKey)
     : { union: null, overlap: null, rows: [], invalid: 0, truncated: false, rowsOverlap: false, absent: true };
-  web.invalid += webInvalid;
-  web.truncated = web.truncated || webTruncated;
-  if (webTruncated) {
-    web.union = null;
-    web.rows = [];
-  }
   const afk = afkEvents
     ? afkEvents.length >= READ_LIMIT
       ? { truncated: true, complete: false }
@@ -251,7 +225,7 @@ export async function loadDashboard(flags, client, mode = "today") {
     apps,
     web,
     afk,
-    timers: await timerCard(flags, client, startMs, endMs, now.getTime()),
+    timers: await timerCard(flags, client, buckets, startMs, endMs, now.getTime()),
   };
   model.categories = await categoryCard(client);
   model.uncategorized = uncategorizedCard(afk, apps, model.categories);
@@ -300,8 +274,9 @@ async function categoryCard(client) {
     const message = error instanceof Error ? error.message : String(error);
     return { state: "unavailable", reason: `Native category settings were not read. ${sanitizeTerminal(message)} Defaults were not created.` };
   }
-  const complete = NATIVE_KEYS.every((key) => presence[key] !== null && presence[key] !== undefined);
-  if (!complete) {
+  try {
+    validateSettings(presence);
+  } catch {
     return { state: "unavailable", reason: "No complete native rule set. Defaults were not created." };
   }
   return {
@@ -310,13 +285,7 @@ async function categoryCard(client) {
   };
 }
 
-async function timerCard(flags, client, startMs, endMs, nowMs) {
-  let buckets;
-  try {
-    buckets = await getBuckets(client);
-  } catch (error) {
-    throw error;
-  }
+async function timerCard(flags, client, buckets, startMs, endMs, nowMs) {
   const matches = Object.values(buckets).filter((bucket) => bucket?.type === "general.stopwatch");
   const chosen = flags.bucket ? matches.filter((bucket) => bucket.id === flags.bucket) : matches;
   if (flags.bucket && chosen.length === 0) {
@@ -340,8 +309,8 @@ async function timerCard(flags, client, startMs, endMs, nowMs) {
   const byLabel = new Map();
   let invalid = 0;
   for (const event of events) {
-    const label = sanitizeTerminal(event?.data?.label).trim();
-    if (!label) {
+    const label = event?.data?.label;
+    if (typeof label !== "string" || label.length === 0 || /[\r\n]/.test(label)) {
       invalid += 1;
       continue;
     }
@@ -374,8 +343,8 @@ async function timerCard(flags, client, startMs, endMs, nowMs) {
   };
 }
 
-export async function dashboardFrom(flags, mode) {
-  return loadDashboard(flags, clientFrom(flags), mode);
+export async function dashboardFrom(flags, mode, signal) {
+  return loadDashboard(flags, clientFrom(flags, signal), mode);
 }
 
 export function rangeModeAllowed(flags) {
